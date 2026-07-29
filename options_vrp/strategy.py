@@ -23,7 +23,8 @@ from .greeks import put_delta
 DEFAULT_BASKET = [
     "SPY", "QQQ", "IWM",          # index anchors (reliable, thin premium)
     "NVDA", "AAPL",               # tech (trimmed from 5 — rich only when tech vol is bid)
-    "LLY", "PFE",                 # healthcare (rich VRP, ~0 corr to tech)
+    "XLV", "PFE",                 # healthcare (XLV = health ETF, liquid + sizeable; LLY dropped —
+                                  #   at ~$1200/share its spread is too wide to size on this book)
     "XOM", "XLE",                 # energy (rich VRP, negative corr to tech)
     "SBUX", "MCD",                # consumer (SBUX richest in screen; MCD defensive, neg corr)
     "DE", "CAT",                  # industrials
