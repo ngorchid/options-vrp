@@ -14,8 +14,21 @@ import pandas as pd
 from . import data, signal
 from .greeks import put_delta
 
-# Small, liquid, well-optioned basket: index/ETF + high-IV single names (rich premium).
-DEFAULT_BASKET = ["SPY", "QQQ", "IWM", "AAPL", "NVDA", "TSLA", "AMD", "META"]
+# Liquid, well-optioned basket spread across sectors (diversified 2026-07-29 from all-mega-cap-
+# tech, which meant a tech vol-spike hit every single name at once — and left the whole pool
+# barren when tech vol was under-priced). Index anchors + 2 tech + health/energy/consumer/
+# industrials/rates. The daily VRP filter picks which are genuinely rich each day; the basket's
+# job is a diverse, liquid POOL where *something* is usually rich + uncorrelated. See
+# scripts/screen_basket.py for the VRP-richness + correlation-to-tech screen behind these picks.
+DEFAULT_BASKET = [
+    "SPY", "QQQ", "IWM",          # index anchors (reliable, thin premium)
+    "NVDA", "AAPL",               # tech (trimmed from 5 — rich only when tech vol is bid)
+    "LLY", "PFE",                 # healthcare (rich VRP, ~0 corr to tech)
+    "XOM", "XLE",                 # energy (rich VRP, negative corr to tech)
+    "SBUX", "MCD",                # consumer (SBUX richest in screen; MCD defensive, neg corr)
+    "DE", "CAT",                  # industrials
+    "TLT",                        # rates (different factor, uncorrelated)
+]
 
 
 @dataclass
