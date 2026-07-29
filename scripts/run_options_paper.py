@@ -101,7 +101,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 fill = broker.close_spread(sp)
                 close_val = fill["net_price"] if fill["net_price"] is not None else cv
                 pnl = state.record_close(sp, close_val, today, action)
-                orders.append({**fill, "pnl": pnl})
+                orders.append({**fill, "pnl": pnl, "reason": action})
 
         # 2) OPEN new spreads if the gate is open and we have room
         res = target_book(cfg)

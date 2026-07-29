@@ -28,13 +28,24 @@ def _rows(open_spreads, values) -> str:
 
 def _trades(orders) -> str:
     if not orders:
-        return "<tr><td colspan=4>— none —</td></tr>"
+        return "<tr><td colspan=5>— none —</td></tr>"
     rows = []
     for o in orders:
-        pnl = "" if o.get("pnl") is None else f"  P&L ${o['pnl']:,.0f}"
+        pnl = "" if o.get("pnl") is None else f"${o['pnl']:,.0f}"
         rows.append(f"<tr><td>{o['action']}</td><td>{o.get('ticker','')}</td>"
-                    f"<td>{o['key']}</td><td>{o.get('status','')}{pnl}</td></tr>")
+                    f"<td>{o['key']}</td><td>{o.get('reason','')}</td>"
+                    f"<td>{o.get('status','')} {pnl}</td></tr>")
     return "\n".join(rows)
+
+
+def _close_tally(trade_log) -> str:
+    """Lifetime count of WHY spreads were closed — the stop-vs-no-stop A/B at a glance."""
+    reasons = [t.get("reason") for t in trade_log if t.get("action") == "CLOSE"]
+    if not reasons:
+        return "no closes yet"
+    from collections import Counter
+    c = Counter(reasons)
+    return "  ".join(f"{r}: {c[r]}" for r in ("profit", "stop", "time") if c.get(r)) or "—"
 
 
 def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=False) -> None:
@@ -47,11 +58,12 @@ def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=F
     <p>Regime VIX/VIX3M = {regime_ratio:.3f} → gate <b>{gate}</b></p>
     <p>Realized ${state.realized_pnl:,.0f} + Unrealized ${unreal:,.0f} = <b>${total:,.0f}</b>
        since {state.inception_date}</p>
+    <p>Closes since inception (why) — <b>{_close_tally(state.trade_log)}</b></p>
     <h3>Open spreads</h3><table border=1 cellpadding=4>
     <tr><th>ticker</th><th>expiry</th><th>spread</th><th>credit</th><th>mark</th><th>unreal P&L</th></tr>
     {_rows(state.open_spreads, values)}</table>
     <h3>Today's trades</h3><table border=1 cellpadding=4>
-    <tr><th>action</th><th>ticker</th><th>spread</th><th>status</th></tr>
+    <tr><th>action</th><th>ticker</th><th>spread</th><th>reason</th><th>status / P&L</th></tr>
     {_trades(orders)}</table>
     </body></html>"""
 
