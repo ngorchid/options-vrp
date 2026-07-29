@@ -107,9 +107,14 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         res = target_book(cfg)
         if res.regime_open:
             room = cfg.max_positions - len(state.open_spreads)
+            # One open position per ticker — never stack a 2nd spread on a name we already hold
+            # (avoids concentrating idiosyncratic risk on one underlying).
+            open_tickers = {sp.ticker for sp in state.open_spreads}
             for s in res.targets:
                 if room <= 0:
                     break
+                if s.ticker in open_tickers:
+                    continue
                 sp = OpenSpread(s.ticker, s.expiry, s.short_strike, s.long_strike, s.contracts,
                                 s.credit, s.max_loss, today, s.spot)
                 if state.has(sp.key):
@@ -118,7 +123,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 if fill["status"] in ("Filled", "Submitted", "PreSubmitted"):
                     credit = fill["net_price"] if fill["net_price"] is not None else s.credit
                     state.record_open(sp, credit, today)
-                    orders.append(fill); room -= 1
+                    orders.append(fill); open_tickers.add(s.ticker); room -= 1
 
         # 3) mark, persist, email
         values = broker.spread_values(state.open_spreads)

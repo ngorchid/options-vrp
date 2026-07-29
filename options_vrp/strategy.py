@@ -172,7 +172,10 @@ def manage_action(entry_credit: float, current_value: float, dte: int,
     back now (from IB marks). Returns 'profit' | 'stop' | 'time' | None. Pure/offline-testable."""
     if current_value <= cfg.profit_target * entry_credit:
         return "profit"
-    if current_value >= cfg.stop_mult * entry_credit:
+    # Stop is debatable for DEFINED-RISK spreads: the long wing already caps max loss, and
+    # short-premium losers often recover by expiry, so a tight stop realizes losses that would
+    # have reverted. Set stop_mult<=0 to disable (rely on the wing + time-stop) for A/B testing.
+    if cfg.stop_mult > 0 and current_value >= cfg.stop_mult * entry_credit:
         return "stop"
     if dte <= cfg.time_stop_dte:
         return "time"
