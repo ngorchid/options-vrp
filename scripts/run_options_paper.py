@@ -95,6 +95,9 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             cv = values.get(sp.key)
             if cv is None:
                 continue
+            # Track the high-water mark BEFORE deciding, so the stop counterfactual is
+            # recorded even on the run that closes the spread.
+            sp.peak_value = max(getattr(sp, "peak_value", 0.0) or 0.0, cv)
             dte = (pd.Timestamp(sp.expiry) - pd.Timestamp(today)).days
             action = manage_action(sp.entry_credit, cv, dte, cfg)
             if action:

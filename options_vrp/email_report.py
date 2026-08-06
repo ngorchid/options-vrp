@@ -38,6 +38,32 @@ def _trades(orders) -> str:
     return "\n".join(rows)
 
 
+def _stop_ab(state, stop_mult: float = 2.0) -> str:
+    """The stop A/B, readable from ONE book: with the stop disabled, a spread whose mark ever
+    touched stop_mult x credit is one the stop WOULD have cut — and its realised P&L shows
+    what that would have cost or saved."""
+    try:
+        r = state.stop_counterfactual(stop_mult)
+    except Exception:  # noqa: BLE001 - reporting must never break the run
+        return ""
+    if not r.get("n"):
+        return ""
+    if not r["n_would_stop"]:
+        return (f"<p style='font-size:13px;color:#475569'>Stop A/B: none of {r['n']} closed "
+                f"spreads ever reached {stop_mult:g}x credit — no evidence either way yet.</p>")
+    edge = r["edge_of_no_stop"]
+    verdict = ("NOT having the stop was better" if edge > 0 else
+               "the stop would have been better")
+    return (f"<p style='font-size:13px;color:#475569'>"
+            f"<b>Stop A/B</b> ({r['n']} closed): <b>{r['n_would_stop']}</b> spreads touched "
+            f"{stop_mult:g}x credit, of which <b>{r['n_recovered']}</b> still finished "
+            f"profitable. That group actually returned <b>${r['actual_pnl_of_stopped_group']:+,.0f}</b>; "
+            f"a {stop_mult:g}x stop would have booked <b>${r['stop_would_have_booked']:+,.0f}</b> "
+            f"&rarr; <b>${edge:+,.0f}</b>, i.e. {verdict}. "
+            f"<i>Only meaningful with stop_mult&lt;=0 (stop disabled) — otherwise the stop "
+            f"truncates the path and the counterfactual is unobservable.</i></p>")
+
+
 def _close_tally(trade_log) -> str:
     """Lifetime count of WHY spreads were closed — the stop-vs-no-stop A/B at a glance."""
     reasons = [t.get("reason") for t in trade_log if t.get("action") == "CLOSE"]
@@ -59,6 +85,7 @@ def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=F
     <p>Realized ${state.realized_pnl:,.0f} + Unrealized ${unreal:,.0f} = <b>${total:,.0f}</b>
        since {state.inception_date}</p>
     <p>Closes since inception (why) — <b>{_close_tally(state.trade_log)}</b></p>
+    {_stop_ab(state)}
     <h3>Open spreads</h3><table border=1 cellpadding=4>
     <tr><th>ticker</th><th>expiry</th><th>spread</th><th>credit</th><th>mark</th><th>unreal P&L</th></tr>
     {_rows(state.open_spreads, values)}</table>

@@ -21,6 +21,11 @@ class OpenSpread:
     max_loss: float        # per share
     entry_date: str
     entry_spot: float
+    # Highest mark seen while open, per share. Lets ONE book answer the stop A/B: with the
+    # stop OFF, peak_value >= stop_mult * entry_credit identifies exactly the trades a stop
+    # WOULD have cut, and the realised P&L shows what they went on to do. With the stop ON
+    # the counterfactual is unobservable, because the stop truncates the path.
+    peak_value: float = 0.0
 
     @property
     def key(self) -> str:
@@ -68,9 +73,41 @@ class OptionsState:
         pnl = (sp.entry_credit - close_value) * 100 * sp.contracts
         self.realized_pnl += pnl
         self.open_spreads = [s for s in self.open_spreads if s.key != sp.key]
+        peak = max(sp.peak_value, close_value)
         self.trade_log.append({"date": today, "action": "CLOSE", "key": sp.key,
-                               "close_value": close_value, "pnl": pnl, "reason": reason})
+                               "close_value": close_value, "pnl": pnl, "reason": reason,
+                               "entry_credit": sp.entry_credit, "peak_value": peak,
+                               "peak_mult": (peak / sp.entry_credit) if sp.entry_credit else None,
+                               "contracts": sp.contracts})
         return pnl
+
+    def stop_counterfactual(self, stop_mult: float = 2.0) -> dict:
+        """Would the 2x stop have helped? Readable only when the stop is DISABLED.
+
+        Splits closed trades into those whose mark ever reached stop_mult x credit ("would
+        have been stopped") and those that did not, and reports what actually happened to
+        each group. `recovered` is the count that touched the threshold and still finished
+        profitable — those are precisely the trades a stop destroys.
+        """
+        rows = [t for t in self.trade_log
+                if t.get("action") == "CLOSE" and t.get("peak_mult") is not None]
+        if not rows:
+            return {"n": 0}
+        hit = [t for t in rows if t["peak_mult"] >= stop_mult]
+        miss = [t for t in rows if t["peak_mult"] < stop_mult]
+        recovered = [t for t in hit if t["pnl"] > 0]
+        # what the stop would have booked instead: -(stop_mult-1) x credit x 100 x contracts
+        stopped_pnl = sum(-(stop_mult - 1.0) * t["entry_credit"] * 100 * t.get("contracts", 1)
+                          for t in hit)
+        return {
+            "n": len(rows),
+            "n_would_stop": len(hit),
+            "n_recovered": len(recovered),
+            "actual_pnl_of_stopped_group": sum(t["pnl"] for t in hit),
+            "stop_would_have_booked": stopped_pnl,
+            "edge_of_no_stop": sum(t["pnl"] for t in hit) - stopped_pnl,
+            "pnl_untouched_group": sum(t["pnl"] for t in miss),
+        }
 
     def record_snapshot(self, today: str, total_pnl: float) -> None:
         self.nav_history.append((today, total_pnl))
