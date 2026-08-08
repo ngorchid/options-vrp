@@ -47,7 +47,14 @@ class OptionsConfig:
     max_positions: int = 6
     # Mechanical management (from the design work) — reduces the end-of-life gamma tail.
     profit_target: float = 0.50       # close when the spread can be bought back for ≤ 50% of entry credit
-    stop_mult: float = 2.0            # close when the spread has doubled (loss ≈ 1× credit)
+    # 0 = NO STOP (default since 2026-08-08). The long wing already caps the loss, and a stop
+    # only converts recoverable losers into realised ones. Confirmed on real OPRA option prices
+    # (SPX 2013-2026, algo_trading/scripts/spx_vrp_lab.py): monotone across settings —
+    # no-stop +$73/trade Sharpe +0.27, 3x +12/+0.05, 2x -44/-0.19, 1.5x -95/-0.47 — and robust
+    # to the cost assumption since cost is constant across arms. Counterfactual: 23% of trades
+    # touch 2x credit and 31% of THOSE still finish profitable; not stopping is worth +$8,468
+    # over 137 trades. Set >0 to re-enable.
+    stop_mult: float = 0.0
     time_stop_dte: int = 21           # close on/under this DTE regardless
 
 
@@ -174,7 +181,8 @@ def manage_action(entry_credit: float, current_value: float, dte: int,
         return "profit"
     # Stop is debatable for DEFINED-RISK spreads: the long wing already caps max loss, and
     # short-premium losers often recover by expiry, so a tight stop realizes losses that would
-    # have reverted. Set stop_mult<=0 to disable (rely on the wing + time-stop) for A/B testing.
+    # have reverted — CONFIRMED on real option prices 2026-08-08, so the stop is now OFF by
+    # default. stop_mult<=0 disables it (rely on the wing + the 21-DTE time-stop).
     if cfg.stop_mult > 0 and current_value >= cfg.stop_mult * entry_credit:
         return "stop"
     if dte <= cfg.time_stop_dte:

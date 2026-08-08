@@ -36,7 +36,8 @@ def _cfg() -> OptionsConfig:
     return OptionsConfig(
         budget=float(os.getenv("BUDGET", "100000")),
         regime_thr=float(os.getenv("REGIME_THR", "1.00")),
-        vrp_min=float(os.getenv("VRP_MIN", "0.02")))
+        vrp_min=float(os.getenv("VRP_MIN", "0.02")),
+        stop_mult=float(os.getenv("STOP_MULT", "0")))
 
 
 # ---------- offline modes ----------
