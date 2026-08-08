@@ -39,6 +39,7 @@ def _cfg() -> OptionsConfig:
         vrp_min=float(os.getenv("VRP_MIN", "0.02")),
         stop_mult=float(os.getenv("STOP_MULT", "0")),
         max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),
+        commission_per_contract=float(os.getenv("COMMISSION_PER_CONTRACT", "0.65")),
         skip_if_no_quote=os.getenv("SKIP_IF_NO_QUOTE", "1") not in ("0", "false", "False"))
 
 
@@ -82,15 +83,25 @@ def selftest(cfg: OptionsConfig) -> None:
     # measured at 59-65% on 2026-08-08, so this is the difference between trading and not.
     print(f"\nSELF-TEST — cost guard (threshold {cfg.max_cost_frac:.0%} of credit, "
           f"skip_if_no_quote={cfg.skip_if_no_quote}):")
-    for label, bid, ask in (("SPX-like   16.50 / 17.00", 16.50, 17.00),
-                            ("marginal    1.00 /  1.30", 1.00, 1.30),
-                            ("PFE-like    0.03 /  0.05", 0.03, 0.05),
-                            ("no quote available      ", None, None)):
-        ok, ratio = cost_ok(bid, ask, cfg.max_cost_frac)
+    print(f"  (commission ${cfg.commission_per_contract:.2f}/contract x 4 sides = "
+          f"${4*cfg.commission_per_contract:.2f} per round trip)")
+    print(f"  {'combo quote':22s} {'credit$/ct':>11s} {'spread':>8s} {'comm':>7s} "
+          f"{'TOTAL':>7s}  verdict")
+    for label, bid, ask in (("SPX-like  16.20/17.10", 16.20, 17.10),
+                            ("SPY-like   1.72/ 1.86", 1.72, 1.86),
+                            ("CAT-like   4.40/ 5.90", 4.40, 5.90),
+                            ("PFE-like   0.02/ 0.04", 0.023, 0.043),
+                            ("no quote available   ", None, None)):
+        ok, ratio, br = cost_ok(bid, ask, cfg.max_cost_frac,
+                                cfg.commission_per_contract, cfg.option_multiplier)
         if ratio is None and not cfg.skip_if_no_quote:
             ok = True
-        rs = "n/a" if ratio is None else f"{ratio:.0%}"
-        print(f"  {label}  cost/credit {rs:>5s}  -> {'TRADE' if ok else 'SKIP'}")
+        if ratio is None:
+            print(f"  {label:22s} {'n/a':>11s} {'n/a':>8s} {'n/a':>7s} {'n/a':>7s}  "
+                  f"{'TRADE' if ok else 'SKIP'}")
+        else:
+            print(f"  {label:22s} {br['credit']:>11,.0f} {br['spread']:>8.0%} "
+                  f"{br['commission']:>7.0%} {ratio:>7.0%}  {'TRADE' if ok else 'SKIP'}")
 
 
 # ---------- live ----------
@@ -144,7 +155,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 # Single-name option spreads run ~4x the index (measured 2026-08-08), which can
                 # eat 60% of the credit against a ~31% break-even. Reject rather than fill.
                 bid, ask = broker.quote_spread(sp)
-                ok, ratio = cost_ok(bid, ask, cfg.max_cost_frac)
+                ok, ratio, br = cost_ok(bid, ask, cfg.max_cost_frac,
+                                        cfg.commission_per_contract, cfg.option_multiplier)
                 if not ok:
                     if ratio is None:
                         msg = "no live quote"
@@ -153,7 +165,9 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                                             sp.ticker, msg)
                             ok = True
                     else:
-                        msg = f"cost {ratio:.0%} of credit > {cfg.max_cost_frac:.0%}"
+                        msg = (f"cost {ratio:.0%} of credit > {cfg.max_cost_frac:.0%} "
+                               f"(spread {br['spread']:.0%} + comm {br['commission']:.0%}, "
+                               f"credit ${br['credit']:,.0f}/ct)")
                     if not ok:
                         logging.info("SKIP %s — %s", sp.ticker, msg)
                         rejected.append({"ticker": sp.ticker, "reason": msg,

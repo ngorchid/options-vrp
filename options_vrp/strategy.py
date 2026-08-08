@@ -63,6 +63,13 @@ class OptionsConfig:
     # basket because it ADAPTS: a name untradeable in a calm week can be fine when premiums are
     # fat and the spread is proportionally smaller.
     max_cost_frac: float = 0.25
+    # Per-CONTRACT commission, one side. IB direct ~USD 0.65 (Fixed); LYNX charges USD 3.50 for
+    # US equity/index options, 5.4x more. A vertical is FOUR contract-sides per round trip, so
+    # this is $2.60 at IB vs $14.00 at LYNX -- and because it is per contract it does NOT
+    # amortise with size. Against PFE's ~$3 credit per contract that is 142% (IB) or 492%
+    # (LYNX) before a single cent of spread. Default assumes the planned move to IB direct.
+    commission_per_contract: float = 0.65
+    option_multiplier: float = 100.0
     # What to do when no live quote is available (no IB market-data sub / Error 162). True =
     # skip the trade. A missed trade costs nothing; a bad fill costs money.
     skip_if_no_quote: bool = True
@@ -184,28 +191,41 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
     return BookResult(ratio, vix, open_, diags, candidates[: cfg.max_positions])
 
 
-def cost_ok(bid: float | None, ask: float | None, max_frac: float) -> tuple[bool, float | None]:
-    """Is the quoted round-trip cost acceptable relative to the credit?
+def cost_ok(bid: float | None, ask: float | None, max_frac: float,
+            commission_per_contract: float = 0.65,
+            multiplier: float = 100.0) -> tuple[bool, float | None, dict]:
+    """Is the TOTAL round-trip cost acceptable relative to the credit?
 
-    You SELL the combo to open (hitting the bid) and BUY it back to close (paying the ask), so
-    the round-trip cost versus mid is one FULL combo width. The credit is the mid. Hence
+    Two components, and they fail in different ways:
 
-        cost / credit = (ask - bid) / mid
+      SPREAD      you SELL the combo to open (hitting the bid) and BUY it back to close
+                  (paying the ask), so the round trip costs one FULL combo width vs mid.
+      COMMISSION  a vertical is FOUR contract-sides per round trip (2 legs x open + close).
+                  This is PER CONTRACT, so it does not shrink with size.
 
-    Returns (ok, ratio). ratio is None when the quote is unusable.
+        cost/credit = (ask-bid)/mid  +  4*commission / (mid*multiplier)
+
+    Contract count cancels from every term, so the ratio is size-independent. Returns
+    (ok, ratio, breakdown); ratio is None when the quote is unusable.
     """
+    empty = {"spread": None, "commission": None, "credit": None}
     if bid is None or ask is None:
-        return False, None
+        return False, None, empty
     try:
         bid, ask = abs(float(bid)), abs(float(ask))
     except (TypeError, ValueError):
-        return False, None
+        return False, None, empty
     lo, hi = min(bid, ask), max(bid, ask)
     mid = (lo + hi) / 2.0
     if mid <= 0 or hi <= lo:
-        return False, None
-    ratio = (hi - lo) / mid
-    return ratio <= max_frac, ratio
+        return False, None, empty
+    credit = mid * multiplier
+    spread_cost = (hi - lo) * multiplier
+    comm_cost = 4.0 * commission_per_contract
+    ratio = (spread_cost + comm_cost) / credit
+    return ratio <= max_frac, ratio, {"spread": spread_cost / credit,
+                                      "commission": comm_cost / credit,
+                                      "credit": credit}
 
 
 def manage_action(entry_credit: float, current_value: float, dte: int,
