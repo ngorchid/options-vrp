@@ -89,6 +89,35 @@ class OptionsBroker:
                      f" @ {fp}" if fp else "")
         return {**base, "net_price": abs(float(fp)) if fp else None, "status": st}
 
+    def quote_spread(self, sp: OpenSpread, wait: float = 3.0) -> tuple[float | None, float | None]:
+        """Live BID/ASK for the vertical as a COMBO.
+
+        The combo is quoted far tighter than the two legs summed, so this is the number that
+        matters. NB it needs an IB market-data subscription — this system otherwise uses
+        yfinance for marks precisely to avoid one — so (None, None) is an expected outcome and
+        the caller must handle it.
+        """
+        if self.dry_run:
+            return None, None
+        try:
+            short_leg = self._leg(sp.ticker, sp.expiry, sp.short_strike)
+            long_leg = self._leg(sp.ticker, sp.expiry, sp.long_strike)
+            if not short_leg or not long_leg:
+                return None, None
+            bag = self._bag(sp.ticker, short_leg, long_leg)
+            tk = self.ib.reqMktData(bag, "", False, False)
+            self.ib.sleep(wait)
+            bid = float(tk.bid) if tk.bid is not None and tk.bid == tk.bid else None
+            ask = float(tk.ask) if tk.ask is not None and tk.ask == tk.ask else None
+            try:
+                self.ib.cancelMktData(bag)
+            except Exception:  # noqa: BLE001
+                pass
+            return bid, ask
+        except Exception as exc:  # noqa: BLE001 - a quote failure must never break the run
+            logging.warning("no combo quote for %s: %r", sp.key, exc)
+            return None, None
+
     def open_spread(self, sp: OpenSpread, wait: float = 5.0) -> dict:
         return self._combo_order(sp, opening=True, wait=wait)
 

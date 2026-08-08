@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 from options_vrp import OptionsConfig, target_book  # noqa: E402
-from options_vrp.strategy import manage_action  # noqa: E402
+from options_vrp.strategy import cost_ok, manage_action  # noqa: E402
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -37,7 +37,9 @@ def _cfg() -> OptionsConfig:
         budget=float(os.getenv("BUDGET", "100000")),
         regime_thr=float(os.getenv("REGIME_THR", "1.00")),
         vrp_min=float(os.getenv("VRP_MIN", "0.02")),
-        stop_mult=float(os.getenv("STOP_MULT", "0")))
+        stop_mult=float(os.getenv("STOP_MULT", "0")),
+        max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),
+        skip_if_no_quote=os.getenv("SKIP_IF_NO_QUOTE", "1") not in ("0", "false", "False"))
 
 
 # ---------- offline modes ----------
@@ -76,6 +78,20 @@ def selftest(cfg: OptionsConfig) -> None:
     for label, cur, dte in cases:
         print(f"  {label:34s} -> {manage_action(sp.entry_credit, cur, dte, cfg) or 'hold'}")
 
+    # Execution cost guard. Break-even is ~31% of credit (SPX backtest); single-name spreads
+    # measured at 59-65% on 2026-08-08, so this is the difference between trading and not.
+    print(f"\nSELF-TEST — cost guard (threshold {cfg.max_cost_frac:.0%} of credit, "
+          f"skip_if_no_quote={cfg.skip_if_no_quote}):")
+    for label, bid, ask in (("SPX-like   16.50 / 17.00", 16.50, 17.00),
+                            ("marginal    1.00 /  1.30", 1.00, 1.30),
+                            ("PFE-like    0.03 /  0.05", 0.03, 0.05),
+                            ("no quote available      ", None, None)):
+        ok, ratio = cost_ok(bid, ask, cfg.max_cost_frac)
+        if ratio is None and not cfg.skip_if_no_quote:
+            ok = True
+        rs = "n/a" if ratio is None else f"{ratio:.0%}"
+        print(f"  {label}  cost/credit {rs:>5s}  -> {'TRADE' if ok else 'SKIP'}")
+
 
 # ---------- live ----------
 def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
@@ -89,6 +105,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         logging.error("IB connect failed — aborting."); return
     state = OptionsState.load(STATE_FILE); state.ensure_inception(today)
     orders: list[dict] = []
+    rejected: list[dict] = []
     try:
         # 1) MANAGE open spreads
         values = broker.spread_values(state.open_spreads)
@@ -123,6 +140,25 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                                 s.credit, s.max_loss, today, s.spot)
                 if state.has(sp.key):
                     continue
+                # EXECUTION COST GUARD — check the live COMBO quote before committing.
+                # Single-name option spreads run ~4x the index (measured 2026-08-08), which can
+                # eat 60% of the credit against a ~31% break-even. Reject rather than fill.
+                bid, ask = broker.quote_spread(sp)
+                ok, ratio = cost_ok(bid, ask, cfg.max_cost_frac)
+                if not ok:
+                    if ratio is None:
+                        msg = "no live quote"
+                        if not cfg.skip_if_no_quote:
+                            logging.warning("%s: %s — trading anyway (SKIP_IF_NO_QUOTE=0)",
+                                            sp.ticker, msg)
+                            ok = True
+                    else:
+                        msg = f"cost {ratio:.0%} of credit > {cfg.max_cost_frac:.0%}"
+                    if not ok:
+                        logging.info("SKIP %s — %s", sp.ticker, msg)
+                        rejected.append({"ticker": sp.ticker, "reason": msg,
+                                         "bid": bid, "ask": ask, "ratio": ratio})
+                        continue
                 fill = broker.open_spread(sp)
                 if fill["status"] in ("Filled", "Submitted", "PreSubmitted"):
                     credit = fill["net_price"] if fill["net_price"] is not None else s.credit
@@ -138,7 +174,20 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         send_report(state, values, orders, res.regime_ratio, res.regime_open, today)
     finally:
         broker.disconnect()
+    if rejected:
+        logging.info("cost guard rejected %d candidate(s): %s", len(rejected),
+                     ", ".join(f"{r['ticker']}({r['reason']})" for r in rejected))
     logging.info("Done %s: %d actions, %d open spreads.", today, len(orders), len(state.open_spreads))
+
+    from options_vrp.strategy import cost_ok
+    print("\nSELF-TEST — execution cost guard (threshold 25% of credit):")
+    for lab, b, a in (("SPX-like  16.50 / 17.00", 16.50, 17.00),
+                      ("marginal   1.00 /  1.30", 1.00, 1.30),
+                      ("PFE-like   0.03 /  0.05", 0.03, 0.05),
+                      ("no quote available     ", None, None)):
+        ok, ratio = cost_ok(b, a, 0.25)
+        rs = "n/a" if ratio is None else f"{ratio:.0%}"
+        print(f"  {lab}  cost/credit {rs:>5s}  -> {'TRADE' if ok else 'SKIP'}")
 
 
 def main() -> None:

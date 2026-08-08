@@ -55,6 +55,17 @@ class OptionsConfig:
     # touch 2x credit and 31% of THOSE still finish profitable; not stopping is worth +$8,468
     # over 137 trades. Set >0 to re-enable.
     stop_mult: float = 0.0
+    # EXECUTION COST GUARD. Refuse a spread whose quoted round-trip cost exceeds this fraction
+    # of the credit. Break-even from the SPX backtest is ~31% of credit, so 0.25 leaves margin.
+    # Measured 2026-08-08 (weekend, provisional): SPX ~15% of credit, but PFE 62% / SBUX 65% /
+    # CAT 59% -- single-name option spreads run ~4x the index (14.6-16.1% of premium vs 3.8%),
+    # so most single names may not clear costs at all. A guard is preferred over pruning the
+    # basket because it ADAPTS: a name untradeable in a calm week can be fine when premiums are
+    # fat and the spread is proportionally smaller.
+    max_cost_frac: float = 0.25
+    # What to do when no live quote is available (no IB market-data sub / Error 162). True =
+    # skip the trade. A missed trade costs nothing; a bad fill costs money.
+    skip_if_no_quote: bool = True
     time_stop_dte: int = 21           # close on/under this DTE regardless
 
 
@@ -171,6 +182,30 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
 
     candidates.sort(key=lambda s: s.vrp, reverse=True)
     return BookResult(ratio, vix, open_, diags, candidates[: cfg.max_positions])
+
+
+def cost_ok(bid: float | None, ask: float | None, max_frac: float) -> tuple[bool, float | None]:
+    """Is the quoted round-trip cost acceptable relative to the credit?
+
+    You SELL the combo to open (hitting the bid) and BUY it back to close (paying the ask), so
+    the round-trip cost versus mid is one FULL combo width. The credit is the mid. Hence
+
+        cost / credit = (ask - bid) / mid
+
+    Returns (ok, ratio). ratio is None when the quote is unusable.
+    """
+    if bid is None or ask is None:
+        return False, None
+    try:
+        bid, ask = abs(float(bid)), abs(float(ask))
+    except (TypeError, ValueError):
+        return False, None
+    lo, hi = min(bid, ask), max(bid, ask)
+    mid = (lo + hi) / 2.0
+    if mid <= 0 or hi <= lo:
+        return False, None
+    ratio = (hi - lo) / mid
+    return ratio <= max_frac, ratio
 
 
 def manage_action(entry_credit: float, current_value: float, dte: int,
