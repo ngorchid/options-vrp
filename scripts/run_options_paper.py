@@ -142,6 +142,34 @@ def selftest(cfg: OptionsConfig) -> None:
               f"quote {row['bid']:.2f}/{row['ask']:.2f}  cost {ratio:>6.0%}  "
               f"{'TRADE' if ok else 'SKIP'}")
 
+    # Leg collision. REGRESSION CASE = SBUX on 2026-08-10: a coarse strike grid put the 16d AND
+    # 10d legs on the SAME strike (95), so picking both by nearest-delta independently and then
+    # rejecting `long >= short` silently killed a genuinely rich-VRP name (+6.9%). The long leg
+    # must be chosen from strikes strictly BELOW the short.
+    print("\nSELF-TEST — leg collision (coarse strike grid, 16d and 10d both nearest 95):")
+    coarse = pd.DataFrame({
+        "strike":           [100.0,  95.0,  90.0,  85.0],
+        "bid":              [ 1.90,  0.70,  0.28,  0.10],
+        "ask":              [ 2.10,  0.82,  0.36,  0.16],
+        "lastPrice":        [ 2.00,  0.76,  0.32,  0.13],
+        # IVs solved so strike 95 is nearest to BOTH the 16d and the 10d target (delta -0.130,
+        # equidistant at 0.030) -- which is what makes the two legs collide.
+        "impliedVolatility": [0.2710, 0.2962, 0.2844, 0.2987],
+        "openInterest":     [ 2200,  1800,  1500,  1100],
+        "volume":           [   40,    25,    18,    11]})
+    cspot, cT = 105.0, 39 / 365.0
+    s = _nearest_delta_strike(coarse, cspot, cT, cfg.rate, cfg.short_delta,
+                              cfg.min_open_interest, cfg.oi_pctile)
+    li = _nearest_delta_strike(coarse, cspot, cT, cfg.rate, cfg.long_delta,
+                               cfg.min_open_interest, cfg.oi_pctile)
+    lb = _nearest_delta_strike(coarse, cspot, cT, cfg.rate, cfg.long_delta,
+                               cfg.min_open_interest, cfg.oi_pctile, below=s[0])
+    print(f"  short leg (16d)                     -> strike {s[0]:g}  delta {s[1]:+.3f}")
+    print(f"  long leg, picked INDEPENDENTLY      -> strike {li[0]:g}  delta {li[1]:+.3f}"
+          f"{'   COLLISION -> old code returned None (no trade)' if li[0] >= s[0] else ''}")
+    print(f"  long leg, forced BELOW the short    -> strike {lb[0]:g}  delta {lb[1]:+.3f}"
+          f"   width {s[0]-lb[0]:g}, credit ${(s[2]-lb[2])*100:,.0f}")
+
 
 # ---------- live ----------
 def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:

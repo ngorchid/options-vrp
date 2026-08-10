@@ -137,8 +137,12 @@ def oi_threshold(puts: pd.DataFrame, min_oi: int, pctile: float) -> float:
 
 
 def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float, target: float,
-                          min_oi: int = 0, oi_pctile: float = 0.0) -> tuple[float, float, float] | None:
+                          min_oi: int = 0, oi_pctile: float = 0.0,
+                          below: float | None = None) -> tuple[float, float, float] | None:
     """(strike, delta, mid_price) of the OTM put whose |delta| is closest to `target`.
+
+    `below` restricts candidates to strikes strictly under it — used to force the long leg at
+    least one increment beneath the short leg (see `build_spread`).
 
     Liquidity-screened. Selecting on delta ALONE lands on dead strikes, and the damage compounds:
     the delta is computed from the provider's `impliedVolatility`, which on a no-open-interest
@@ -154,6 +158,8 @@ def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float, t
         K, bid, ask, iv = row["strike"], row["bid"], row["ask"], row["impliedVolatility"]
         if K >= spot or bid <= 0 or ask <= 0 or not (0.01 < iv < 5):
             continue
+        if below is not None and K >= below:
+            continue
         if floor > 0:
             oi = pd.to_numeric(row.get("openInterest"), errors="coerce")
             if oi != oi or oi < floor:               # NaN or below the floor -> not a real line
@@ -167,12 +173,27 @@ def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float, t
 
 def build_spread(ticker: str, puts: pd.DataFrame, spot: float, expiry: str, dte: int,
                  iv: float, rv: float, cfg: OptionsConfig) -> SpreadTarget | None:
+    """Build the 16d/10d put credit spread, or None if this chain cannot support one.
+
+    The legs are picked SEQUENTIALLY, not independently: the long leg is chosen only from strikes
+    strictly BELOW the short. Choosing both by nearest-delta and rejecting the collision afterwards
+    silently dropped names whose strike grid is coarse relative to their vol — SBUX 2026-08-10 put
+    both the 16d and 10d legs on strike 95, so a genuinely rich-VRP name (+6.9%) never traded at
+    all. Stepping down one increment always yields a real spread where one exists.
+
+    Consequence to be aware of: when the grid is that coarse the long leg lands further OTM than
+    the 10d target, so the spread is WIDER than intended, max loss per contract is larger and the
+    position sizes to fewer contracts. That is the correct trade-off — a slightly wider spread is
+    a real position, a collapsed one is nothing — but it is why width is not a constant here.
+    """
     T = dte / 365.0
     short = _nearest_delta_strike(puts, spot, T, cfg.rate, cfg.short_delta,
                                   cfg.min_open_interest, cfg.oi_pctile)
+    if short is None:
+        return None
     long_ = _nearest_delta_strike(puts, spot, T, cfg.rate, cfg.long_delta,
-                                  cfg.min_open_interest, cfg.oi_pctile)
-    if short is None or long_ is None or long_[0] >= short[0]:
+                                  cfg.min_open_interest, cfg.oi_pctile, below=short[0])
+    if long_ is None:
         return None
     credit = short[2] - long_[2]
     width = short[0] - long_[0]
