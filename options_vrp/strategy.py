@@ -73,6 +73,14 @@ class OptionsConfig:
     # What to do when no live quote is available (no IB market-data sub / Error 162). True =
     # skip the trade. A missed trade costs nothing; a bad fill costs money.
     skip_if_no_quote: bool = True
+    # LIQUIDITY SCREEN on strike selection. A strike with no open interest gets no competitive
+    # quote: nobody holds it, so no market maker has inventory to hedge or reason to post tight.
+    # Measured on EEM 2026-08-10 -- the 1-sigma strike quoted 0.30/0.90 (104% of credit, REJECTED)
+    # while the strike one increment up quoted 0.55/0.65 (21%, PASSES) on the IDENTICAL 0.600 mid.
+    # Screening on OI rather than volume because volume is a same-day flow that reads 0 on liquid
+    # strikes early in the session, while OI is a stock. See `oi_threshold` for why both bounds.
+    min_open_interest: int = 50
+    oi_pctile: float = 0.25
     time_stop_dte: int = 21           # close on/under this DTE regardless
 
 
@@ -108,14 +116,48 @@ def pick_expiry(expiries: tuple[str, ...], today: pd.Timestamp,
     return best
 
 
-def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float,
-                          target: float) -> tuple[float, float, float] | None:
-    """(strike, delta, mid_price) of the OTM put whose |delta| is closest to `target`."""
+def oi_threshold(puts: pd.DataFrame, min_oi: int, pctile: float) -> float:
+    """Open-interest floor for this chain: an absolute minimum AND a share of the name's own book.
+
+    Both, because either alone fails somewhere. A flat number sensible for SPY (OI in the
+    thousands) is meaningless for a thinly-optioned name; a pure percentile always admits its own
+    bottom strikes no matter how dead the whole chain is. Taking the max means a name with no
+    real open interest anywhere simply produces no trade — the correct outcome, and consistent
+    with `skip_if_no_quote`: a missed trade costs nothing, a bad fill costs money.
+    """
+    # Test the COLUMN first: pd.to_numeric(None) returns a scalar NaN, not None, so an
+    # `is None` check after the conversion silently never fires.
+    if puts is None or "openInterest" not in getattr(puts, "columns", ()):
+        return 0.0                                   # screen disabled — provider gave us nothing
+    oi = pd.to_numeric(puts["openInterest"], errors="coerce")
+    if not oi.notna().any():
+        return 0.0
+    q = float(oi[oi > 0].quantile(pctile)) if (oi > 0).any() else 0.0
+    return max(float(min_oi), q if q == q else 0.0)
+
+
+def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float, target: float,
+                          min_oi: int = 0, oi_pctile: float = 0.0) -> tuple[float, float, float] | None:
+    """(strike, delta, mid_price) of the OTM put whose |delta| is closest to `target`.
+
+    Liquidity-screened. Selecting on delta ALONE lands on dead strikes, and the damage compounds:
+    the delta is computed from the provider's `impliedVolatility`, which on a no-open-interest
+    strike is inverted from a garbage mid — so a bad quote yields a bad IV yields a bad delta, and
+    an illiquid line can masquerade as the 16-delta strike. The cost guard cannot repair this
+    because it runs AFTER selection: it vetoes the whole trade rather than re-picking the strike.
+    Screening here instead means we trade a neighbouring strike at nearly identical risk (adjacent
+    strikes differ by ~1-3 delta points) rather than not trading at all.
+    """
+    floor = oi_threshold(puts, min_oi, oi_pctile) if min_oi or oi_pctile else 0.0
     rows = []
     for _, row in puts.iterrows():
         K, bid, ask, iv = row["strike"], row["bid"], row["ask"], row["impliedVolatility"]
         if K >= spot or bid <= 0 or ask <= 0 or not (0.01 < iv < 5):
             continue
+        if floor > 0:
+            oi = pd.to_numeric(row.get("openInterest"), errors="coerce")
+            if oi != oi or oi < floor:               # NaN or below the floor -> not a real line
+                continue
         d = put_delta(spot, K, T, r, iv)
         rows.append((K, d, (bid + ask) / 2))
     if not rows:
@@ -126,8 +168,10 @@ def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float,
 def build_spread(ticker: str, puts: pd.DataFrame, spot: float, expiry: str, dte: int,
                  iv: float, rv: float, cfg: OptionsConfig) -> SpreadTarget | None:
     T = dte / 365.0
-    short = _nearest_delta_strike(puts, spot, T, cfg.rate, cfg.short_delta)
-    long_ = _nearest_delta_strike(puts, spot, T, cfg.rate, cfg.long_delta)
+    short = _nearest_delta_strike(puts, spot, T, cfg.rate, cfg.short_delta,
+                                  cfg.min_open_interest, cfg.oi_pctile)
+    long_ = _nearest_delta_strike(puts, spot, T, cfg.rate, cfg.long_delta,
+                                  cfg.min_open_interest, cfg.oi_pctile)
     if short is None or long_ is None or long_[0] >= short[0]:
         return None
     credit = short[2] - long_[2]

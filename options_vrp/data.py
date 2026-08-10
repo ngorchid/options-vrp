@@ -33,7 +33,23 @@ def option_expiries(ticker: str) -> tuple[object, tuple[str, ...]]:
 
 
 def puts(tk, expiry: str) -> pd.DataFrame:
-    """OTM-relevant put chain for one expiry: strike, bid, ask, lastPrice, impliedVolatility."""
+    """OTM-relevant put chain for one expiry.
+
+    `openInterest` drives the liquidity screen in `strategy._nearest_delta_strike` — a strike
+    nobody holds gets no competitive quote (EEM 2026-08-10: the 1-sigma strike quoted 0.30/0.90
+    while BOTH neighbours quoted ~0.10 wide on the SAME mid). `volume` is carried for diagnostics
+    only: it is a same-day FLOW that reads 0 early in the session on perfectly liquid strikes,
+    whereas open interest is a STOCK and stays meaningful. Note OI is published once daily by the
+    OCC overnight, so intraday it is always the previous close — stale for a signal, fine for a
+    liquidity screen.
+    """
     ch = tk.option_chain(expiry)
-    cols = ["strike", "bid", "ask", "lastPrice", "impliedVolatility"]
-    return ch.puts[cols].copy()
+    cols = ["strike", "bid", "ask", "lastPrice", "impliedVolatility", "openInterest", "volume"]
+    have = [c for c in cols if c in ch.puts.columns]
+    out = ch.puts[have].copy()
+    # Tolerate a provider that stops returning these: a missing column disables the screen
+    # (handled in _nearest_delta_strike) rather than crashing the daily run.
+    for c in ("openInterest", "volume"):
+        if c not in out.columns:
+            out[c] = float("nan")
+    return out

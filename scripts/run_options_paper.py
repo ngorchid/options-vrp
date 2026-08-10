@@ -24,7 +24,8 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 from options_vrp import OptionsConfig, target_book  # noqa: E402
-from options_vrp.strategy import cost_ok, manage_action  # noqa: E402
+from options_vrp.strategy import (  # noqa: E402
+    _nearest_delta_strike, cost_ok, manage_action, oi_threshold)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -40,6 +41,8 @@ def _cfg() -> OptionsConfig:
         stop_mult=float(os.getenv("STOP_MULT", "0")),
         max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),
         commission_per_contract=float(os.getenv("COMMISSION_PER_CONTRACT", "0.65")),
+        min_open_interest=int(os.getenv("MIN_OPEN_INTEREST", "50")),
+        oi_pctile=float(os.getenv("OI_PCTILE", "0.25")),
         skip_if_no_quote=os.getenv("SKIP_IF_NO_QUOTE", "1") not in ("0", "false", "False"))
 
 
@@ -102,6 +105,42 @@ def selftest(cfg: OptionsConfig) -> None:
         else:
             print(f"  {label:22s} {br['credit']:>11,.0f} {br['spread']:>8.0%} "
                   f"{br['commission']:>7.0%} {ratio:>7.0%}  {'TRADE' if ok else 'SKIP'}")
+
+    # Liquidity screen. REGRESSION CASE = the real EEM chain quoted in TWS on 2026-08-10: the
+    # 1-sigma strike had NO open interest and quoted 0.30/0.90 (104% of credit -> rejected) while
+    # BOTH neighbours quoted ~0.10 wide on essentially the same mid. Selecting on delta alone
+    # picks the dead strike and loses the trade; the screen must pick a neighbour instead.
+    print(f"\nSELF-TEST — liquidity screen (min OI {cfg.min_open_interest}, "
+          f"pctile {cfg.oi_pctile:.0%} of the chain's own OI):")
+    # IVs solved so strike 44 sits EXACTLY on the 16-delta target -- i.e. the dead strike is
+    # precisely what delta-only selection would choose. Quotes are EEM's real ones. Note 44's
+    # IV (0.224) is itself contaminated: it is inverted from the garbage 0.60 mid, which is the
+    # compounding failure -- a bad quote yields a bad IV yields a bad delta.
+    spot, T = 47.0, 39 / 365.0
+    chain = pd.DataFrame({
+        "strike":           [46.0,   45.0,   44.0,   43.0,   42.0],
+        "bid":              [1.15,   0.55,   0.30,   0.43,   0.18],
+        "ask":              [1.25,   0.65,   0.90,   0.54,   0.23],
+        "lastPrice":        [1.20,   0.60,   0.60,   0.48,   0.20],
+        "impliedVolatility": [0.1582, 0.1609, 0.2243, 0.2515, 0.2689],
+        "openInterest":     [1400,   1100,      0,    900,    480],   # 44.0 is the dead strike
+        "volume":           [  31,     12,      0,      8,      3]})
+    floor = oi_threshold(chain, cfg.min_open_interest, cfg.oi_pctile)
+    print(f"  OI floor for this chain = {floor:,.0f} contracts")
+    for label, mn, pc in (("screen OFF (old behaviour)", 0, 0.0),
+                          ("screen ON", cfg.min_open_interest, cfg.oi_pctile)):
+        pick = _nearest_delta_strike(chain, spot, T, cfg.rate, 0.16, mn, pc)
+        if pick is None:
+            print(f"  {label:26s} -> no eligible strike (no trade)")
+            continue
+        K, d, mid = pick
+        oi = int(chain.loc[chain["strike"] == K, "openInterest"].iloc[0])
+        row = chain.loc[chain["strike"] == K].iloc[0]
+        ok, ratio, _ = cost_ok(row["bid"], row["ask"], cfg.max_cost_frac,
+                               cfg.commission_per_contract, cfg.option_multiplier)
+        print(f"  {label:26s} -> strike {K:g}  delta {d:+.3f}  OI {oi:>5,}  "
+              f"quote {row['bid']:.2f}/{row['ask']:.2f}  cost {ratio:>6.0%}  "
+              f"{'TRADE' if ok else 'SKIP'}")
 
 
 # ---------- live ----------
