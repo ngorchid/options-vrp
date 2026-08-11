@@ -249,9 +249,19 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             action = manage_action(sp.entry_credit, cv, dte, cfg)
             if action:
                 fill = broker.close_spread(sp)
-                close_val = fill["net_price"] if fill["net_price"] is not None else cv
-                pnl = state.record_close(sp, close_val, today, action)
-                orders.append({**fill, "pnl": pnl, "reason": action})
+                # Only BOOK the close when it actually FILLED. A DAY order left at
+                # PreSubmitted/PendingSubmit (e.g. submitted near the close) may never fill;
+                # recording it would drop the spread from state while it stays open at IB —
+                # the phantom-close bug (a pending SBUX close was booked as realized profit
+                # on 2026-08-07, then never filled). Leave an unfilled close open so it is
+                # retried / reconciled next run rather than booked off the mark.
+                if fill["status"] == "Filled" and fill["net_price"] is not None:
+                    pnl = state.record_close(sp, fill["net_price"], today, action)
+                    orders.append({**fill, "pnl": pnl, "reason": action})
+                else:
+                    logging.warning("close for %s NOT filled (status=%s) — left open to retry",
+                                    sp.key, fill["status"])
+                    orders.append({**fill, "pnl": None, "reason": f"{action} (unfilled)"})
 
         # 2) OPEN new spreads if the gate is open and we have room
         res = target_book(cfg)
