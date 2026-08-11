@@ -20,6 +20,15 @@ from .greeks import put_delta
 # industrials/rates. The daily VRP filter picks which are genuinely rich each day; the basket's
 # job is a diverse, liquid POOL where *something* is usually rich + uncorrelated. See
 # scripts/screen_basket.py for the VRP-richness + correlation-to-tech screen behind these picks.
+# ETFs and indices: no earnings, ever. Held explicitly so that a FAILED lookup (which also
+# returns None) cannot be mistaken for "no earnings" on a single name, nor a provider outage
+# wrongly halt the index sleeve. Any ticker NOT listed here is treated as an earnings name.
+NO_EARNINGS_TICKERS = frozenset({
+    "SPY", "QQQ", "IWM", "XLV", "XLE", "TLT", "GLD", "SLV", "HYG", "LQD", "EEM", "EFA",
+    "XLF", "XLP", "XLY", "XLI", "XLK", "XLU", "XLB", "XLC", "XLRE", "DIA", "VTI", "IVV",
+    "SPX", "XSP", "VIX",
+})
+
 DEFAULT_BASKET = [
     "SPY", "QQQ", "IWM",          # index anchors (reliable, thin premium)
     "NVDA", "AAPL",               # tech (trimmed from 5 — rich only when tech vol is bid)
@@ -81,6 +90,24 @@ class OptionsConfig:
     # strikes early in the session, while OI is a stock. See `oi_threshold` for why both bounds.
     min_open_interest: int = 50
     oi_pctile: float = 0.25
+    # EARNINGS FILTER. A 30-45d hold on a single name straddles an earnings print roughly half the
+    # time, and the VRP filter actively STEERS INTO it: VRP = ATM_IV - RV20, and ahead of earnings
+    # IV rises for the event while RV20 (trailing) does not, so the score is mechanically inflated
+    # exactly where the binary risk sits. Measured on 8,600 simulated 39-day holds over the 8
+    # single names 2005-2026: earnings-spanning holds carry E[loss] 0.091 of width vs 0.050, and
+    # P(max loss) 7.3% vs 3.8% -- about DOUBLE both, with 2/3 of breaches going straight to max
+    # loss (a gap signature, not drift). The market pays only ~+14% more credit for it (NVDA
+    # ladder), against ~+52% needed to break even on the best available estimate.
+    # NOT SETTLED -- the verdict flips if the market widens strikes 25-30% for the event and the
+    # measurement is one name. Default ON regardless, because a skipped trade costs nothing and,
+    # decisively, the walk-forward that validated 16d/10d + VRP>2 ran on SPX -- AN INDEX WITH NO
+    # EARNINGS -- so event-spanning single-name trades are untested by anything we have.
+    earnings_filter: bool = True
+    earnings_buffer_days: int = 2      # companies confirm late and move dates; clear the event early
+    # `next_earnings` returns None both for a genuine ETF and for a failed lookup. True = treat
+    # unknown as PENDING (skip), matching skip_if_no_quote. Known ETFs are exempted by
+    # NO_EARNINGS_TICKERS so a provider outage cannot silently halt the index sleeve.
+    skip_if_earnings_unknown: bool = True
     time_stop_dte: int = 21           # close on/under this DTE regardless
 
 
@@ -104,16 +131,57 @@ class SpreadTarget:
 
 
 def pick_expiry(expiries: tuple[str, ...], today: pd.Timestamp,
-                dte_min: int, dte_max: int) -> tuple[str, int] | None:
-    """Choose the expiry whose DTE lands in [min,max], nearest the window midpoint."""
+                dte_min: int, dte_max: int,
+                before: pd.Timestamp | None = None) -> tuple[str, int] | None:
+    """Choose the expiry whose DTE lands in [min,max], nearest the window midpoint.
+
+    `before` (an earnings date, already buffered) restricts candidates to expiries that settle
+    BEFORE it. Selecting the expiry is strictly better than opening a spread and closing it the
+    day before the event: the event premium does NOT decay ahead of the event, so an early close
+    sells inflated vol and buys it back still inflated, capturing only ordinary theta while paying
+    a full round trip. Measured on the real 2026-08-10 combos, closing early nets NEGATIVE for any
+    event inside ~day 20 (SBUX 20.0% cost) or ~day 26 (CAT 27.7%) of a 39-day hold — and beyond
+    that the 50% profit target would have closed the position anyway. Choosing the expiry instead
+    keeps the full premium, the profit target, and zero event exposure.
+
+    Returns None when no expiry both fits the window and clears the event, which is the correct
+    outcome: the name is simply not tradeable this cycle.
+    """
     mid = (dte_min + dte_max) / 2
     best = None
     for e in expiries:
+        if before is not None and pd.Timestamp(e) >= before:
+            continue
         dte = (pd.Timestamp(e) - today).days
         if dte_min <= dte <= dte_max:
             if best is None or abs(dte - mid) < abs(best[1] - mid):
                 best = (e, dte)
     return best
+
+
+def earnings_cutoff(ticker: str, cfg: OptionsConfig,
+                    lookup=None) -> tuple[pd.Timestamp | None, str]:
+    """(cutoff, note): expiries must settle strictly BEFORE `cutoff`. None = unrestricted.
+
+    Three branches, and the frequencies matter for how restrictive this is. A name reports about
+    every 91 days, so over a 30-45 DTE window: the event is beyond the window ~51% of the time
+    (no action), inside the window ~16% (shift the expiry), and nearer than dte_min ~33% (skip).
+    That is far milder than a blanket "skip if earnings within 45 days", which would sideline the
+    name ~49% of the time.
+    """
+    if not cfg.earnings_filter or ticker in NO_EARNINGS_TICKERS:
+        return None, ""
+    fn = lookup or data.next_earnings
+    d = fn(ticker)
+    if d is None:
+        # Unknown, not absent -- the ticker is not a known ETF, so the lookup failed or the
+        # company has not confirmed. Fail safe.
+        # Timestamp.MIN, not MAX. The cutoff means "expiries must settle BEFORE this", so MAX
+        # would let EVERY expiry through -- unguarded, the exact opposite of failing safe.
+        # MIN excludes them all, so pick_expiry returns None and the name is skipped.
+        return (pd.Timestamp.min, "earnings date unknown - skipped") if cfg.skip_if_earnings_unknown \
+            else (None, "earnings date unknown - traded anyway")
+    return d - pd.Timedelta(days=cfg.earnings_buffer_days), f"earnings {d.date()}"
 
 
 def oi_threshold(puts: pd.DataFrame, min_oi: int, pctile: float) -> float:
@@ -231,9 +299,14 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
                "vrp": float("nan"), "expiry": None, "dte": None, "note": ""}
         try:
             tk, expiries = data.option_expiries(tk_name)
-            pick = pick_expiry(expiries, today, cfg.dte_min, cfg.dte_max)
+            cutoff, enote = earnings_cutoff(tk_name, cfg)
+            pick = pick_expiry(expiries, today, cfg.dte_min, cfg.dte_max, before=cutoff)
             if pick is None:
-                rec["note"] = "no expiry in DTE window"; diags.append(rec); continue
+                rec["note"] = (f"no expiry clears {enote}" if cutoff is not None
+                               else "no expiry in DTE window")
+                diags.append(rec); continue
+            if enote:
+                rec["note"] = enote        # kept when a trade IS made, so the log shows the date
             expiry, dte = pick
             pdf = data.puts(tk, expiry)
             iv = signal.atm_iv(pdf, spot)

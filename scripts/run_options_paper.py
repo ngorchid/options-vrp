@@ -25,7 +25,8 @@ sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv  # noqa: E402
 from options_vrp import OptionsConfig, target_book  # noqa: E402
 from options_vrp.strategy import (  # noqa: E402
-    _nearest_delta_strike, cost_ok, manage_action, oi_threshold)
+    _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
+    pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -42,6 +43,8 @@ def _cfg() -> OptionsConfig:
         max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),
         commission_per_contract=float(os.getenv("COMMISSION_PER_CONTRACT", "0.65")),
         min_open_interest=int(os.getenv("MIN_OPEN_INTEREST", "50")),
+        earnings_filter=os.getenv("EARNINGS_FILTER", "1") not in ("0", "false", "False"),
+        earnings_buffer_days=int(os.getenv("EARNINGS_BUFFER_DAYS", "2")),
         oi_pctile=float(os.getenv("OI_PCTILE", "0.25")),
         skip_if_no_quote=os.getenv("SKIP_IF_NO_QUOTE", "1") not in ("0", "false", "False"))
 
@@ -169,6 +172,32 @@ def selftest(cfg: OptionsConfig) -> None:
           f"{'   COLLISION -> old code returned None (no trade)' if li[0] >= s[0] else ''}")
     print(f"  long leg, forced BELOW the short    -> strike {lb[0]:g}  delta {lb[1]:+.3f}"
           f"   width {s[0]-lb[0]:g}, credit ${(s[2]-lb[2])*100:,.0f}")
+
+    # Earnings filter. Three branches, plus the fail-safe. The MIN/MAX sentinel is the subtle
+    # part: the cutoff means "expiries must settle BEFORE this", so an unknown date must map to
+    # Timestamp.MIN (excludes everything -> skip). Timestamp.MAX would admit every expiry, i.e.
+    # trade UNGUARDED -- the opposite of failing safe.
+    print(f"\nSELF-TEST — earnings filter (buffer {cfg.earnings_buffer_days}d, "
+          f"dte {cfg.dte_min}-{cfg.dte_max}, skip_if_unknown={cfg.skip_if_earnings_unknown}):")
+    exps = ("2026-08-14", "2026-08-21", "2026-08-28", "2026-09-04", "2026-09-11",
+            "2026-09-18", "2026-09-25", "2026-10-16")
+    tday = pd.Timestamp("2026-08-11")
+    cases = [("beyond the window", pd.Timestamp("2026-10-29")),
+             ("inside the window", pd.Timestamp("2026-09-20")),
+             ("nearer than dte_min", pd.Timestamp("2026-08-20"))]
+    base = pick_expiry(exps, tday, cfg.dte_min, cfg.dte_max)
+    print(f"  {'(no filter)':24s} -> {base[0]} ({base[1]}d)")
+    for label, d in cases:
+        cut, _ = earnings_cutoff("XX", cfg, lookup=lambda _t, _d=d: _d)
+        got = pick_expiry(exps, tday, cfg.dte_min, cfg.dte_max, before=cut)
+        print(f"  earnings {str(d.date())} {label:22s} -> "
+              f"{f'{got[0]} ({got[1]}d)' if got else 'SKIP — no expiry clears it'}")
+    for tk, fn, lbl in [("SPY", lambda _t: None, "known ETF, exempt"),
+                        ("MYSTERY", lambda _t: None, "unknown -> must SKIP")]:
+        cut, note = earnings_cutoff(tk, cfg, lookup=fn)
+        got = pick_expiry(exps, tday, cfg.dte_min, cfg.dte_max, before=cut)
+        print(f"  {tk:8s} {lbl:29s} -> "
+              f"{f'{got[0]} ({got[1]}d)' if got else 'SKIP'}   {note}")
 
 
 # ---------- live ----------

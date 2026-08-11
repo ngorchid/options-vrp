@@ -53,3 +53,25 @@ def puts(tk, expiry: str) -> pd.DataFrame:
         if c not in out.columns:
             out[c] = float("nan")
     return out
+
+
+def next_earnings(ticker: str) -> pd.Timestamp | None:
+    """Next scheduled earnings date, or None if the name has none (ETF) or the lookup fails.
+
+    Uses `Ticker.calendar`, NOT `get_earnings_dates`: the latter returns only HISTORY, so
+    filtering it for future dates yields an empty result that reads exactly like "this name has
+    no earnings" — a silent failure that would disable the filter on precisely the single names
+    it exists for.
+
+    CANNOT distinguish "genuinely no earnings" from "lookup failed" — both return None, and the
+    caller must decide. `OptionsConfig.skip_if_earnings_unknown` treats None as PENDING for names
+    that are not known ETFs, matching `skip_if_no_quote`: a missed trade costs nothing.
+    """
+    try:
+        cal = yf.Ticker(ticker).calendar or {}
+        dates = cal.get("Earnings Date") or []
+        if not dates:
+            return None
+        return pd.Timestamp(min(dates))
+    except Exception:  # noqa: BLE001 — any provider failure is "unknown", handled by the caller
+        return None
