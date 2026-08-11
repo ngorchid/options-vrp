@@ -28,10 +28,15 @@ from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
-from risk_guard import RiskLimits, check_order, effective_budget  # noqa: E402
+from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
+                        install_alert_collector, missed_runs)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+# WARNING+ collected for the daily email. Matters most HERE: SKIP_IF_NO_QUOTE=1 can silently halt
+# ALL trading, and an off-hours chain makes VRP negative for every name — both look like a normal
+# quiet day in the report unless the warning is delivered.
+ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
 
 
@@ -313,7 +318,11 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                      for sp in state.open_spreads if sp.key in values)
         state.record_snapshot(today, state.realized_pnl + unreal)
         state.save(STATE_FILE)
-        send_report(state, values, orders, res.regime_ratio, res.regime_open, today)
+        _m, _l, _note = missed_runs(state.nav_history, today)
+        if _note:
+            logging.warning("heartbeat: %s", _note)
+        send_report(state, values, orders, res.regime_ratio, res.regime_open, today,
+                    alerts=ALERTS)
     finally:
         broker.disconnect()
     if rejected:

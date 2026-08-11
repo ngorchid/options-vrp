@@ -74,12 +74,16 @@ def _close_tally(trade_log) -> str:
     return "  ".join(f"{r}: {c[r]}" for r in ("profit", "stop", "time") if c.get(r)) or "—"
 
 
-def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=False) -> None:
+def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=False,
+                alerts=None) -> None:
     unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
                  for sp in state.open_spreads if sp.key in values)
     total = state.realized_pnl + unreal
     gate = "OPEN (contango)" if gate_open else "SHUT (backwardation)"
-    html = f"""<html><body style="font-family:sans-serif">
+    _alert_html = alerts.html() if (alerts is not None and getattr(alerts, "records", None)) else ""
+    _mark = (f"[{alerts.worst} x{len(alerts.records)}] "
+             if alerts is not None and getattr(alerts, "worst", None) else "")
+    html = f"""<html><body style="font-family:sans-serif">{_alert_html}
     <h2>Options VRP paper — {today}</h2>
     <p>Regime VIX/VIX3M = {regime_ratio:.3f} → gate <b>{gate}</b></p>
     <p>Realized ${state.realized_pnl:,.0f} + Unrealized ${unreal:,.0f} = <b>${total:,.0f}</b>
@@ -98,7 +102,7 @@ def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=F
     if dry_run or not (user and pw and to):
         logging.info("email skipped (dry_run or EMAIL_* unset)"); return
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Options VRP paper — {today}  (${total:,.0f})"
+    msg["Subject"] = _mark + f"Options VRP paper — {today}  (${total:,.0f})"
     msg["From"], msg["To"] = user, to
     msg.attach(MIMEText(html, "html"))
     try:
