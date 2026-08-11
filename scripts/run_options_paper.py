@@ -28,15 +28,32 @@ from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
+from risk_guard import effective_budget  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
 
 
-def _cfg() -> OptionsConfig:
+def _cfg(state: OptionsState | None = None) -> OptionsConfig:
+    """BUDGET is the BASE capital; sizing compounds off this strategy's OWN realised P&L.
+
+    So names come online by themselves as the account grows (a name is tradeable only when its
+    max loss per contract fits risk_per_trade x budget) and position size shrinks after losses,
+    with no manual edit and no restart.
+
+    Deliberately NOT IB NetLiquidation: three strategies share one account, so NetLiq would have
+    each of them sizing as though it owned the whole thing. Realised-only for now, which lags
+    gains and therefore UNDER-sizes after a good run -- the right way to be wrong.
+    """
+    base = float(os.getenv("BUDGET", "100000"))
+    budget = base
+    if state is not None:
+        budget, note = effective_budget(base, state.realized_pnl,
+                                        step=float(os.getenv("BUDGET_STEP", "0.10")))
+        logging.info("budget: %s", note)
     return OptionsConfig(
-        budget=float(os.getenv("BUDGET", "100000")),
+        budget=budget,
         regime_thr=float(os.getenv("REGIME_THR", "1.00")),
         vrp_min=float(os.getenv("VRP_MIN", "0.02")),
         stop_mult=float(os.getenv("STOP_MULT", "0")),
@@ -308,7 +325,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=int(os.getenv("IB_PORT", "7497")))
     ap.add_argument("--client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "7")))
     args = ap.parse_args()
-    cfg = _cfg()
+    cfg = _cfg(OptionsState.load(STATE_FILE))
 
     if args.selftest:
         selftest(cfg); return
