@@ -29,7 +29,7 @@ from options_vrp.strategy import (  # noqa: E402
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
-                        install_alert_collector, missed_runs)
+                        install_alert_collector, missed_runs, push_if_alerts)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -323,6 +323,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             logging.warning("heartbeat: %s", _note)
         send_report(state, values, orders, res.regime_ratio, res.regime_open, today,
                     alerts=ALERTS)
+        push_if_alerts(ALERTS, "Options VRP")
     finally:
         broker.disconnect()
     if rejected:
