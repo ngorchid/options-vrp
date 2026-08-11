@@ -331,16 +331,6 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                      ", ".join(f"{r['ticker']}({r['reason']})" for r in rejected))
     logging.info("Done %s: %d actions, %d open spreads.", today, len(orders), len(state.open_spreads))
 
-    from options_vrp.strategy import cost_ok
-    print("\nSELF-TEST — execution cost guard (threshold 25% of credit):")
-    for lab, b, a in (("SPX-like  16.50 / 17.00", 16.50, 17.00),
-                      ("marginal   1.00 /  1.30", 1.00, 1.30),
-                      ("PFE-like   0.03 /  0.05", 0.03, 0.05),
-                      ("no quote available     ", None, None)):
-        ok, ratio = cost_ok(b, a, 0.25)
-        rs = "n/a" if ratio is None else f"{ratio:.0%}"
-        print(f"  {lab}  cost/credit {rs:>5s}  -> {'TRADE' if ok else 'SKIP'}")
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
