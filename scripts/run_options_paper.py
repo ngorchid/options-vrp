@@ -28,7 +28,7 @@ from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
-from risk_guard import effective_budget  # noqa: E402
+from risk_guard import RiskLimits, check_order, effective_budget  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -286,6 +286,21 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                         rejected.append({"ticker": sp.ticker, "reason": msg,
                                          "bid": bid, "ask": ask, "ratio": ratio})
                         continue
+                # INDEPENDENT PRE-TRADE GUARD — re-derives the order from the budget rather
+                # than trusting `s.contracts`, because a guard that reuses the strategy's own
+                # sizing cannot catch a sizing bug. Notional here is MAX LOSS (what a defined-risk
+                # spread can actually cost), not the credit.
+                lim = RiskLimits.for_options(cfg.budget)
+                chk = check_order(sp.ticker, "SELL", sp.contracts, sp.max_loss,
+                                  cfg.option_multiplier, lim,
+                                  gross_notional=sum(x.contracts * x.max_loss *
+                                                     cfg.option_multiplier
+                                                     for x in state.open_spreads))
+                if not chk:
+                    logging.warning("RISK REJECT %s", chk.reason)
+                    rejected.append({"ticker": sp.ticker, "reason": chk.reason,
+                                     "bid": bid, "ask": ask, "ratio": ratio})
+                    continue
                 fill = broker.open_spread(sp)
                 if fill["status"] in ("Filled", "Submitted", "PreSubmitted"):
                     credit = fill["net_price"] if fill["net_price"] is not None else s.credit
