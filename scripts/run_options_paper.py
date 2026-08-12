@@ -29,7 +29,8 @@ from options_vrp.strategy import (  # noqa: E402
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
-                        install_alert_collector, missed_runs, push_if_alerts)
+                        install_alert_collector, missed_runs, push_if_alerts,
+                        reconcile)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -328,6 +329,26 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                      for sp in state.open_spreads if sp.key in values)
         state.record_snapshot(today, state.realized_pnl + unreal)
         state.save(STATE_FILE)
+        # RECONCILE state against IB. Motivated by the 2026-08-07 phantom close: a pending
+        # close was booked as filled, so state dropped a spread that stayed open at IB with
+        # nothing left to manage it. Each spread is two legs; compare per LEG, since a partial
+        # fill can leave one leg on. Report only — never auto-correct a shared account.
+        actual = broker.put_positions()
+        if actual is not None:
+            from options_vrp.broker import _ib_expiry
+            exp: dict[tuple, float] = {}
+            for sp in state.open_spreads:
+                e = _ib_expiry(sp.expiry)
+                exp[(sp.ticker, e, float(sp.short_strike))] = -float(sp.contracts)
+                exp[(sp.ticker, e, float(sp.long_strike))] = float(sp.contracts)
+            keyed_exp = {f"{k[0]} {k[1]} {k[2]:g}P": v for k, v in exp.items()}
+            keyed_act = {f"{k[0]} {k[1]} {k[2]:g}P": v for k, v in actual.items()}
+            _d, _rnote = reconcile(keyed_exp, keyed_act, label="options")
+            if _rnote:
+                logging.warning("%s", _rnote)
+        else:
+            logging.warning("reconcile: IB positions unavailable — state NOT verified this run")
+
         _m, _l, _note = missed_runs(state.nav_history, today)
         if _note:
             logging.warning("heartbeat: %s", _note)

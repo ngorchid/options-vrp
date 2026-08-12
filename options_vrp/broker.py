@@ -125,6 +125,28 @@ class OptionsBroker:
         return self._combo_order(sp, opening=False, wait=wait)
 
     # --- marks (from portfolio feed; no market-data sub needed) ---
+    def put_positions(self) -> dict[tuple, float] | None:
+        """{(symbol, expiry, strike) -> signed contracts} for SHORT-PUT-bearing legs at IB.
+
+        Filtered to OPT/P deliberately: this account is shared with the equity and futures
+        strategies, and an unfiltered read would report their positions as orphans. Returns None
+        (not {}) when unavailable, so the caller can tell "nothing held" from "could not check" —
+        an empty dict would make every state position look like a phantom.
+        """
+        if self.dry_run or self.ib is None:
+            return None
+        try:
+            out: dict[tuple, float] = {}
+            for it in self.ib.portfolio():
+                c = it.contract
+                if c.secType == "OPT" and c.right == "P" and it.position:
+                    k = (c.symbol, c.lastTradeDateOrContractMonth, float(c.strike))
+                    out[k] = out.get(k, 0.0) + float(it.position)
+            return out
+        except Exception as e:  # noqa: BLE001
+            logging.warning("put_positions failed: %s", e)
+            return None
+
     def spread_values(self, open_spreads: list[OpenSpread]) -> dict[str, float]:
         """{spread.key -> current per-share debit to close} = short_put_mark − long_put_mark.
         Empty for dry-run or legs not found in the portfolio."""
