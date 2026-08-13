@@ -7,12 +7,20 @@ budget. Pure/offline (no IB) so the dry-run book is fully inspectable before any
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import pandas as pd
 
 from . import data, signal
 from .greeks import put_delta
+
+# risk_guard.py lives at the REPO ROOT, not in this package. The runner puts ROOT on sys.path.
+try:
+    from risk_guard import RiskLimits, chain_sane
+except ImportError:  # guard unavailable -> keep trading, just unscreened
+    RiskLimits = None
+    chain_sane = None
 
 # Liquid, well-optioned basket spread across sectors (diversified 2026-07-29 from all-mega-cap-
 # tech, which meant a tech vol-spike hit every single name at once — and left the whole pool
@@ -290,6 +298,8 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
     prices = data.price_history(cfg.basket)
     diags: list[dict] = []
     candidates: list[SpreadTarget] = []
+    bad_chains: list[str] = []
+    checked_chains = 0
     for tk_name in cfg.basket:
         if tk_name not in prices.columns:
             continue
@@ -308,9 +318,22 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
             if enote:
                 rec["note"] = enote        # kept when a trade IS made, so the log shows the date
             expiry, dte = pick
+            checked_chains += 1
             pdf = data.puts(tk, expiry)
             iv = signal.atm_iv(pdf, spot)
             rec.update(iv=iv, vrp=signal.vrp(iv, rv), expiry=expiry, dte=dte)
+            # CHAIN SANITY. Outside US hours the provider returns bid=0/ask=0/OI=0 and a CONSTANT
+            # junk IV (SPY 38d read 1.56% on 2026-08-11 against 12.2% in hours). VRP = IV - RV is
+            # then hugely negative for EVERY name, so the book reports "gate open but nothing
+            # passed the VRP filters" -- indistinguishable from a genuinely quiet day. Computing a
+            # VRP from that number is the failure; refuse to, and say so.
+            if chain_sane is not None:
+                cs = chain_sane(tk_name, iv, pdf.get("bid"), RiskLimits(budget=cfg.budget))
+                if not cs:
+                    rec["note"] = cs.reason
+                    bad_chains.append(tk_name)
+                    diags.append(rec)
+                    continue
             if open_ and signal.vrp(iv, rv) > cfg.vrp_min:
                 sp = build_spread(tk_name, pdf, spot, expiry, dte, iv, rv, cfg)
                 if sp and sp.contracts > 0:
@@ -324,6 +347,17 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
         except Exception as e:  # noqa: BLE001
             rec["note"] = f"chain error: {type(e).__name__}"
         diags.append(rec)
+
+    # SYSTEMIC vs per-name. One junk chain is a bad ticker; EVERY chain junk is a broken feed or
+    # an off-hours run, and that distinction is the whole point -- otherwise "no name passed the
+    # filters" reads as a quiet market when the data is simply unusable.
+    if checked_chains and len(bad_chains) == checked_chains:
+        logging.error("ALL %d option chains failed sanity (%s) — data source unusable, NOT a "
+                      "quiet market. Check the run time is inside US market hours.",
+                      checked_chains, ", ".join(bad_chains[:6]))
+    elif bad_chains:
+        logging.warning("chain sanity rejected %d of %d: %s",
+                        len(bad_chains), checked_chains, ", ".join(bad_chains))
 
     candidates.sort(key=lambda s: s.vrp, reverse=True)
     return BookResult(ratio, vix, open_, diags, candidates[: cfg.max_positions])
