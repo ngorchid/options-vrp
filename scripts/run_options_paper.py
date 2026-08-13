@@ -32,7 +32,8 @@ from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, margin_check, MarginLimits,
-                        write_equity, book_drawdown, BookLevels)
+                        write_equity, book_drawdown, BookLevels,
+                        BreakerLevels, realised_vol)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -293,7 +294,9 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         _eq = _base + state.realized_pnl + _unreal
         _peak = max(peak_equity(state.nav_history, _base), _eq)
         write_equity(ROOT.parent, "options-vrp", _eq, _peak)
-        _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak)
+        # Vol-scaled to this sleeve's own equity curve (nav_history here is TUPLES).
+        _lv = BreakerLevels.from_vol(realised_vol(state.nav_history, _base))
+        _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak, _lv)
         if _bwhy:
             (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
         # BOOK-level: three sleeves each down 20% all sit under their own 25% threshold while the
