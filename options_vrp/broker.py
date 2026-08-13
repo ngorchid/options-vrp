@@ -81,7 +81,17 @@ class OptionsBroker:
         order = MarketOrder(action, sp.contracts)
         order.tif = "DAY"
         trade = self.ib.placeOrder(bag, order)
-        self.ib.sleep(wait)
+        # Poll up to `wait` seconds, returning as soon as the order reaches a terminal state.
+        # A single fixed sleep too often read the status while still PreSubmitted, so the email
+        # and state showed an unfilled order that had actually filled a second later (and, for a
+        # close, that gap is what left a spread open in state while IB had closed it). Polling
+        # reflects the real fill without slowing liquid names.
+        waited = 0.0
+        while waited < wait:
+            self.ib.sleep(1.0)
+            waited += 1.0
+            if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                break
         st = trade.orderStatus.status
         fp = trade.orderStatus.avgFillPrice or None
         logging.info("%s %dx %s %g/%gp -> %s%s", "OPEN" if opening else "CLOSE",
@@ -118,10 +128,10 @@ class OptionsBroker:
             logging.warning("no combo quote for %s: %r", sp.key, exc)
             return None, None
 
-    def open_spread(self, sp: OpenSpread, wait: float = 5.0) -> dict:
+    def open_spread(self, sp: OpenSpread, wait: float = 20.0) -> dict:
         return self._combo_order(sp, opening=True, wait=wait)
 
-    def close_spread(self, sp: OpenSpread, wait: float = 5.0) -> dict:
+    def close_spread(self, sp: OpenSpread, wait: float = 20.0) -> dict:
         return self._combo_order(sp, opening=False, wait=wait)
 
     # --- marks (from portfolio feed; no market-data sub needed) ---
