@@ -17,10 +17,11 @@ from .greeks import put_delta
 
 # risk_guard.py lives at the REPO ROOT, not in this package. The runner puts ROOT on sys.path.
 try:
-    from risk_guard import RiskLimits, chain_sane
+    from risk_guard import RiskLimits, chain_sane, data_fresh
 except ImportError:  # guard unavailable -> keep trading, just unscreened
     RiskLimits = None
     chain_sane = None
+    data_fresh = None
 
 # Liquid, well-optioned basket spread across sectors (diversified 2026-07-29 from all-mega-cap-
 # tech, which meant a tech vol-spike hit every single name at once — and left the whole pool
@@ -296,6 +297,17 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
     open_ = signal.regime_open(ratio, cfg.regime_thr)
 
     prices = data.price_history(cfg.basket)
+    # STALENESS on the price panel. RV20 comes from these prices, so a frozen feed yields a
+    # stale realised vol and therefore a wrong VRP for every name — plausible numbers, wrong
+    # decisions. Distinct from chain_sane, which screens the OPTION side.
+    if data_fresh is not None and RiskLimits is not None:
+        _f = data_fresh(prices.index, today, RiskLimits(budget=cfg.budget))
+        if not _f:
+            logging.error("data staleness: %s — no book built today", _f.reason)
+            return BookResult(ratio, vix, False, [{"ticker": "-", "spot": float("nan"),
+                                                   "rv": float("nan"), "iv": float("nan"),
+                                                   "vrp": float("nan"), "expiry": None,
+                                                   "dte": None, "note": _f.reason}], [])
     diags: list[dict] = []
     candidates: list[SpreadTarget] = []
     bad_chains: list[str] = []
