@@ -31,7 +31,8 @@ from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
-                        circuit_breaker, peak_equity, margin_check, MarginLimits)
+                        circuit_breaker, peak_equity, margin_check, MarginLimits,
+                        write_equity, book_drawdown, BookLevels)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -282,6 +283,32 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                                     sp.key, fill["status"])
                     orders.append({**fill, "pnl": None, "reason": f"{action} (unfilled)"})
 
+        # CIRCUIT BREAKER — here, AFTER management, so it can see UNREALISED P&L from the live
+        # marks just fetched. Realised-only was blind to exactly the drawdowns that matter: a
+        # short-put book can be deep underwater with nothing booked until it closes. Placed
+        # before the OPEN loop so it can only ever block NEW risk.
+        _unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
+                      for sp in state.open_spreads if sp.key in values)
+        _base = float(os.getenv("BUDGET", "100000"))
+        _eq = _base + state.realized_pnl + _unreal
+        _peak = max(peak_equity(state.nav_history, _base), _eq)
+        write_equity(ROOT.parent, "options-vrp", _eq, _peak)
+        _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak)
+        if _bwhy:
+            (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
+        # BOOK-level: three sleeves each down 20% all sit under their own 25% threshold while the
+        # total is down 20%. Take the WORSE of own and book.
+        _bdd, _beq, _bpk, _bnote = book_drawdown(ROOT.parent)
+        if _bdd is not None:
+            _lvl2, _sc2, _why2 = circuit_breaker(_beq, _bpk, BookLevels())
+            if _why2:
+                logging.warning("BOOK circuit breaker: %s | %s", _why2, _bnote)
+            _bscale = min(_bscale, _sc2)
+        if _bscale <= 0:
+            cfg.max_positions = 0
+        elif _bscale < 1.0:
+            cfg.risk_per_trade *= _bscale
+
         # 2) OPEN new spreads if the gate is open and we have room
         res = target_book(cfg)
         if res.regime_open:
@@ -405,21 +432,7 @@ def main() -> None:
         logging.warning("HALTED (new risk): %s — managing open spreads only", _hwhy)
         cfg.max_positions = 0
 
-    # CIRCUIT BREAKER on this sleeve's own equity (base + realised P&L). nav_history here is a
-    # list of (date, total_pnl) TUPLES, not dicts — peak_equity handles both. derisk halves
-    # risk_per_trade; reduce_only/halt stop opening while management (profit target, 21-DTE time
-    # stop) keeps running, because leaving short options unmanaged into expiry is worse than the
-    # drawdown that triggered it. Never auto-flattens.
-    _state0 = OptionsState.load(STATE_FILE)
-    _base = float(os.getenv("BUDGET", "100000"))
-    _peak = peak_equity(_state0.nav_history, _base)
-    _blvl, _bscale, _bwhy = circuit_breaker(_base + _state0.realized_pnl, _peak)
-    if _bwhy:
-        (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
-    if _bscale <= 0:
-        cfg.max_positions = 0
-    elif _bscale < 1.0:
-        cfg.risk_per_trade *= _bscale
+
 
     if args.selftest:
         selftest(cfg); return
