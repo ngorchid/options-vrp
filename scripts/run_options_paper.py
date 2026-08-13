@@ -31,7 +31,7 @@ from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
-                        circuit_breaker, peak_equity)
+                        circuit_breaker, peak_equity, margin_check, MarginLimits)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -238,6 +238,23 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
     orders: list[dict] = []
     rejected: list[dict] = []
     try:
+        # MARGIN CEILING — needs a live connection, so it sits after connect() rather than at
+        # config time. Reading is ACCOUNT-WIDE: three strategies share the account, so this
+        # sleeve can be blocked by the overlay's futures margin. Correct — the constraint really
+        # is shared, and being blocked beats being liquidated. Only ever blocks NEW spreads;
+        # management below runs regardless, since leaving short options unmanaged into expiry is
+        # worse than the margin pressure that triggered it.
+        _mu = broker.margin_usage()
+        _mlvl, _mscale, _mwhy = margin_check(*(_mu if _mu else (float("nan"), 0.0)),
+                                             limits=MarginLimits())
+        if _mwhy:
+            (logging.error if _mlvl in ("derisk", "halt") else logging.warning)(
+                "margin: %s", _mwhy)
+        if _mscale <= 0 and _mlvl != "unknown":
+            cfg.max_positions = 0
+        elif 0 < _mscale < 1.0:
+            cfg.risk_per_trade *= _mscale
+
         # 1) MANAGE open spreads
         values = broker.spread_values(state.open_spreads)
         for sp in list(state.open_spreads):
