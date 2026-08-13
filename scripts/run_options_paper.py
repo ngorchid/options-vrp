@@ -30,7 +30,8 @@ from options_vrp.strategy import (  # noqa: E402
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
-                        reconcile, halt_state, HALT_ALL, HALT_NEW)
+                        reconcile, halt_state, HALT_ALL, HALT_NEW,
+                        circuit_breaker, peak_equity)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -386,6 +387,22 @@ def main() -> None:
     if _halt == HALT_NEW:
         logging.warning("HALTED (new risk): %s — managing open spreads only", _hwhy)
         cfg.max_positions = 0
+
+    # CIRCUIT BREAKER on this sleeve's own equity (base + realised P&L). nav_history here is a
+    # list of (date, total_pnl) TUPLES, not dicts — peak_equity handles both. derisk halves
+    # risk_per_trade; reduce_only/halt stop opening while management (profit target, 21-DTE time
+    # stop) keeps running, because leaving short options unmanaged into expiry is worse than the
+    # drawdown that triggered it. Never auto-flattens.
+    _state0 = OptionsState.load(STATE_FILE)
+    _base = float(os.getenv("BUDGET", "100000"))
+    _peak = peak_equity(_state0.nav_history, _base)
+    _blvl, _bscale, _bwhy = circuit_breaker(_base + _state0.realized_pnl, _peak)
+    if _bwhy:
+        (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
+    if _bscale <= 0:
+        cfg.max_positions = 0
+    elif _bscale < 1.0:
+        cfg.risk_per_trade *= _bscale
 
     if args.selftest:
         selftest(cfg); return
