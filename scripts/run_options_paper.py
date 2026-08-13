@@ -33,7 +33,7 @@ from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, margin_check, MarginLimits,
                         write_equity, book_drawdown, BookLevels,
-                        BreakerLevels, realised_vol)
+                        BreakerLevels, blended_vol)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -42,6 +42,12 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 # quiet day in the report unless the warning is delivered.
 ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
+
+# Annualised vol prior for the circuit-breaker levels, from the SPX VRP backtest marked daily
+# (algo_trading/scripts/breaker_calibration_lab.py, live spec): 12.5%.
+# ⚠ Measured on the SPX sleeve only; the live 14-name basket may differ. Update if the basket,
+# risk_per_trade or max_positions changes materially.
+VOL_PRIOR = 0.125
 
 
 def _cfg(state: OptionsState | None = None) -> OptionsConfig:
@@ -295,7 +301,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         _peak = max(peak_equity(state.nav_history, _base), _eq)
         write_equity(ROOT.parent, "options-vrp", _eq, _peak)
         # Vol-scaled to this sleeve's own equity curve (nav_history here is TUPLES).
-        _lv = BreakerLevels.from_vol(realised_vol(state.nav_history, _base))
+        _lv = BreakerLevels.from_vol(blended_vol(state.nav_history, _base, VOL_PRIOR))
         _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak, _lv)
         if _bwhy:
             (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
