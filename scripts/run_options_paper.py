@@ -44,10 +44,23 @@ ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
 
 # Annualised vol prior for the circuit-breaker levels, from the SPX VRP backtest marked daily
-# (algo_trading/scripts/breaker_calibration_lab.py, live spec): 12.5%.
-# ⚠ Measured on the SPX sleeve only; the live 14-name basket may differ. Update if the basket,
-# risk_per_trade or max_positions changes materially.
-VOL_PRIOR = 0.125
+# (algo_trading/scripts/breaker_calibration_lab.py, live spec): 6.3%.
+#
+# ⚠ CORRECTED 2026-08-13 from 12.5%, which was WRONG BY 2x. The backtest series has only ~64
+# observations per CALENDAR year — the sleeve holds a position roughly a quarter of the time —
+# and it was annualised with sqrt(252) as if it were daily. Correct factor is sqrt(64), so the
+# vol was overstated by sqrt(252/64) ~ 2.0. The tell was that its worst drawdown came out at
+# 0.91 sigma against 1.90 for trend and 1.19 for magic formula; at the corrected vol it is 1.80
+# sigma, in line with the others.
+#
+# This affects the PRIOR only. The live nav_history records a snapshot every run, so it IS daily
+# and `realised_vol`'s sqrt(252) is right for it — the estimate converges to the truth as history
+# accumulates; only the cold-start number was wrong.
+#
+# ⚠ Measured on the SPX sleeve only; the live 14-name basket carries idiosyncratic single-name
+# risk SPX does not, so its true vol is probably higher. Update if the basket, risk_per_trade or
+# max_positions changes materially.
+VOL_PRIOR = 0.063
 
 
 def _cfg(state: OptionsState | None = None) -> OptionsConfig:
