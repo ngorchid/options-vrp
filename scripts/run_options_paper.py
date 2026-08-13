@@ -30,7 +30,7 @@ from options_vrp.strategy import (  # noqa: E402
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
-                        reconcile)
+                        reconcile, halt_state, HALT_ALL, HALT_NEW)
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -372,6 +372,20 @@ def main() -> None:
     ap.add_argument("--client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "7")))
     args = ap.parse_args()
     cfg = _cfg(OptionsState.load(STATE_FILE))
+
+    # KILL SWITCH. HALT_ALL exits before connecting. HALT keeps MANAGEMENT running — profit
+    # targets and the 21-DTE time stop still fire — but opens nothing new. Blocking management
+    # would leave short options running into expiry unmanaged, which is worse than whatever
+    # prompted the halt.
+    _halt, _hwhy = halt_state(ROOT)
+    if _halt == HALT_ALL:
+        logging.error("HALTED (all): %s — exiting without trading. NOTE: profit targets and the "
+                      "21-DTE time stop did NOT run.", _hwhy)
+        push_if_alerts(ALERTS, "Options VRP")
+        return
+    if _halt == HALT_NEW:
+        logging.warning("HALTED (new risk): %s — managing open spreads only", _hwhy)
+        cfg.max_positions = 0
 
     if args.selftest:
         selftest(cfg); return
