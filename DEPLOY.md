@@ -54,13 +54,22 @@ with the book small (it sizes to a few contracts) so a mistake is cheap.
 
 ## Schedule
 Run **daily on weekdays, during US market hours (RTH)** so entries fill the same session and
-management can act same-day. ~15:30 ET (21:30 CET) is a good slot — late enough for stable chains,
+management can act same-day. ~15:30 ET is a good slot — late enough for stable chains,
 before the close.
+
+⚠ `/ST` uses the BOX's LOCAL clock, and the box is on CET — so this must be **21:30**, not
+15:30. It read 15:30 until 2026-08-14, which is 09:30 ET: the market OPEN, the widest
+spreads and least stable chains of the day. Since the cost guard keys entirely off spread
+width, that systematically inflated measured cost-of-credit and would have skipped trades
+that should pass.
+
+Running LAST is also deliberate: margin in the shared account is first-come-first-served,
+and this is the lowest-Sharpe sleeve (0.52 vs magic-formula 0.96, trend 0.74).
 
 ```bat
 schtasks /Create /TN "OptionsVRPPaper" ^
   /TR "C:\trading\options-vrp\scripts\run_options_paper.py --live" ^
-  /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 15:30 /F
+  /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 21:30 /F
 ```
 (Wrap in a .bat that activates the venv, like the other systems, if preferred.)
 

@@ -29,7 +29,8 @@ from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
-from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
+from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+                        check_allocations, check_order,
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, liquidity_check, MarginLimits,
@@ -62,15 +63,16 @@ STATE_FILE = ROOT / "results" / "paper" / "state.json"
 # risk SPX does not, so its true vol is probably higher. Update if the basket, risk_per_trade or
 # max_positions changes materially.
 VOL_PRIOR = 0.063
-# BASE CAPITAL for sizing. 75k is a RISK BASE, not cash set aside: peak margin on this book is
-# structurally max_positions x risk_per_trade = 6 x 3% = 18% of budget, so 75k peaks at ~$13.5k
-# of margin against the shared account's collateral. Chosen 2026-08-14 from the capital sweep
-# (algo_trading/scripts/vrp_capital_sweep.py): it is the top of the Sharpe curve (+0.52), gets 12
-# of 13 names sizeable, and its ~15%-of-budget modelled drawdown is ~21% of a 50k account -- which
-# has to be survivable ALONGSIDE magic-formula, since VRP runs +0.23 tail-conditional correlation
-# to it (short vol and long equity are the same bet in a crash).
-# Must match BUDGET in .env; the default exists so a missing .env cannot silently size at 100k.
-BASE_BUDGET = "75000"
+# BASE CAPITAL is no longer set here. It is this sleeve's share of live account NetLiquidation,
+# from the validated table in risk_guard.ALLOCATIONS — see `allocated_budget`. The old hard-coded
+# $75,000 was chosen from the capital sweep against a $50k account, which meant three sleeves
+# holding $50k + $75k + $100k of independently-set budget on one $50k account: 74% of NAV in
+# maintenance, tripping `no_new_risk` on an ordinary day with nothing able to see it.
+#
+# The sweep's finding still holds and is now reached automatically: peak margin is structurally
+# max_positions x risk_per_trade = 6 x 3% = 18% of budget, and because the budget tracks NetLiq,
+# this sleeve arrives at its measured $75-100k plateau as the account grows, with no edit.
+# `BUDGET` in .env still overrides for a deliberate one-off, and says so in the log.
 
 
 def _cfg(state: OptionsState | None = None) -> OptionsConfig:
@@ -84,10 +86,23 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
     each of them sizing as though it owned the whole thing. Realised-only for now, which lags
     gains and therefore UNDER-sizes after a good run -- the right way to be wrong.
     """
-    base = float(os.getenv("BUDGET", BASE_BUDGET))
-    budget = base
-    if state is not None:
-        budget, note = effective_budget(base, state.realized_pnl,
+    # Budget is this sleeve's SHARE of the live account, not a hand-set number. The fractions
+    # live in one validated table (risk_guard.ALLOCATIONS) whose summed peak margin must leave
+    # >= 40% cushion, so the three sleeves can no longer be resized independently into a
+    # combination that does not fit -- which is what $50k + $75k + $100k of budget on a $50k
+    # account was. BUDGET in .env still overrides, for a deliberate one-off.
+    _alloc_ok = check_allocations()
+    if not _alloc_ok:
+        logging.error("ALLOCATION: %s", _alloc_ok.reason)
+    _override = os.getenv("BUDGET")
+    if _override:
+        budget = float(_override)
+        logging.info("budget: $%s from BUDGET override — allocation table BYPASSED",
+                     f"{budget:,.0f}")
+    else:
+        budget, note = allocated_budget("options-vrp",
+                                        getattr(state, "last_net_liq", 0.0) or None,
+                                        float(os.getenv("NOMINAL_NAV", str(NOMINAL_NAV))),
                                         step=float(os.getenv("BUDGET_STEP", "0.10")))
         logging.info("budget: %s", note)
     return OptionsConfig(
@@ -278,6 +293,10 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         _mu = broker.margin_cushion()
         _mlvl, _mscale, _mwhy = liquidity_check(*(_mu if _mu else (float("nan"), 0.0)),
                                                 limits=MarginLimits())
+        # Same call already returns NetLiq; store it so the NEXT run can size off the real
+        # account instead of the nominal anchor.
+        if _mu and _mu[1] and _mu[1] > 0:
+            state.last_net_liq = float(_mu[1])
         if _mwhy:
             (logging.error if _mlvl in ("derisk", "halt") else logging.warning)(
                 "margin: %s", _mwhy)
@@ -319,7 +338,11 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # before the OPEN loop so it can only ever block NEW risk.
         _unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
                       for sp in state.open_spreads if sp.key in values)
-        _base = float(os.getenv("BUDGET", BASE_BUDGET))
+        # cfg.budget, NOT a re-read of the env: sizing now comes from the allocation table, and
+        # a breaker measuring drawdown against a DIFFERENT base than the one being traded would
+        # fire at the wrong level. Sizing and the breaker reading different numbers is
+        # exactly the drift the single-constant rule was introduced to prevent.
+        _base = cfg.budget
         _eq = _base + state.realized_pnl + _unreal
         _peak = max(peak_equity(state.nav_history, _base), _eq)
         write_equity(ROOT.parent, "options-vrp", _eq, _peak)
