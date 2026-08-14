@@ -32,7 +32,7 @@ from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, margin_check, MarginLimits,
-                        write_equity, book_drawdown, BookLevels,
+                        write_equity, book_drawdown, book_vol,
                         BreakerLevels, blended_vol)
 
 load_dotenv(ROOT / ".env")
@@ -322,7 +322,13 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # total is down 20%. Take the WORSE of own and book.
         _bdd, _beq, _bpk, _bnote = book_drawdown(ROOT.parent)
         if _bdd is not None:
-            _lvl2, _sc2, _why2 = circuit_breaker(_beq, _bpk, BookLevels())
+            # Book levels scale to the BOOK's OWN vol, not a hard-coded tighter set. With one
+            # strategy live the book curve IS that strategy's, so the levels come out identical
+            # and this adds nothing — correct, since there is no diversification to reward.
+            # Skipped entirely until the book has enough history to estimate its vol.
+            _bvol = book_vol(ROOT.parent)
+            _lvl2, _sc2, _why2 = (circuit_breaker(_beq, _bpk, BreakerLevels.from_vol(_bvol))
+                                  if _bvol else ('ok', 1.0, ''))
             if _why2:
                 logging.warning("BOOK circuit breaker: %s | %s", _why2, _bnote)
             _bscale = min(_bscale, _sc2)
