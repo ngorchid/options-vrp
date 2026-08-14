@@ -32,7 +32,7 @@ from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (RiskLimits, check_order, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
-                        circuit_breaker, peak_equity, margin_check, MarginLimits,
+                        circuit_breaker, peak_equity, liquidity_check, MarginLimits,
                         write_equity, book_drawdown, book_vol,
                         BreakerLevels, blended_vol)
 
@@ -275,9 +275,9 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # is shared, and being blocked beats being liquidated. Only ever blocks NEW spreads;
         # management below runs regardless, since leaving short options unmanaged into expiry is
         # worse than the margin pressure that triggered it.
-        _mu = broker.margin_usage()
-        _mlvl, _mscale, _mwhy = margin_check(*(_mu if _mu else (float("nan"), 0.0)),
-                                             limits=MarginLimits())
+        _mu = broker.margin_cushion()
+        _mlvl, _mscale, _mwhy = liquidity_check(*(_mu if _mu else (float("nan"), 0.0)),
+                                                limits=MarginLimits())
         if _mwhy:
             (logging.error if _mlvl in ("derisk", "halt") else logging.warning)(
                 "margin: %s", _mwhy)
