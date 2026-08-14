@@ -62,6 +62,15 @@ STATE_FILE = ROOT / "results" / "paper" / "state.json"
 # risk SPX does not, so its true vol is probably higher. Update if the basket, risk_per_trade or
 # max_positions changes materially.
 VOL_PRIOR = 0.063
+# BASE CAPITAL for sizing. 75k is a RISK BASE, not cash set aside: peak margin on this book is
+# structurally max_positions x risk_per_trade = 6 x 3% = 18% of budget, so 75k peaks at ~$13.5k
+# of margin against the shared account's collateral. Chosen 2026-08-14 from the capital sweep
+# (algo_trading/scripts/vrp_capital_sweep.py): it is the top of the Sharpe curve (+0.52), gets 12
+# of 13 names sizeable, and its ~15%-of-budget modelled drawdown is ~21% of a 50k account -- which
+# has to be survivable ALONGSIDE magic-formula, since VRP runs +0.23 tail-conditional correlation
+# to it (short vol and long equity are the same bet in a crash).
+# Must match BUDGET in .env; the default exists so a missing .env cannot silently size at 100k.
+BASE_BUDGET = "75000"
 
 
 def _cfg(state: OptionsState | None = None) -> OptionsConfig:
@@ -75,7 +84,7 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
     each of them sizing as though it owned the whole thing. Realised-only for now, which lags
     gains and therefore UNDER-sizes after a good run -- the right way to be wrong.
     """
-    base = float(os.getenv("BUDGET", "100000"))
+    base = float(os.getenv("BUDGET", BASE_BUDGET))
     budget = base
     if state is not None:
         budget, note = effective_budget(base, state.realized_pnl,
@@ -310,7 +319,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # before the OPEN loop so it can only ever block NEW risk.
         _unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
                       for sp in state.open_spreads if sp.key in values)
-        _base = float(os.getenv("BUDGET", "100000"))
+        _base = float(os.getenv("BUDGET", BASE_BUDGET))
         _eq = _base + state.realized_pnl + _unreal
         _peak = max(peak_equity(state.nav_history, _base), _eq)
         write_equity(ROOT.parent, "options-vrp", _eq, _peak)

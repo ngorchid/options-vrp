@@ -107,7 +107,7 @@ class OptionsConfig:
     dte_min: int = 30
     dte_max: int = 45
     rate: float = 0.04                # risk-free for delta calc
-    budget: float = 100_000.0
+    budget: float = 75_000.0   # risk base, not cash; see BASE_BUDGET in run_options_paper
     risk_per_trade: float = 0.03      # max loss per spread position ≤ 3% of budget (fits high-IV names)
     max_positions: int = 6
     # Max simultaneous positions sharing a factor group (see SECTOR). Binds well before
