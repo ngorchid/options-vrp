@@ -38,6 +38,34 @@ NO_EARNINGS_TICKERS = frozenset({
     "SPX", "XSP", "VIX",
 })
 
+# Factor group per name, for the selection-time concentration cap. The basket was CONSTRUCTED
+# for sector diversity (2026-07-29, after an all-tech basket meant one vol spike hit every name
+# at once) — but nothing enforced diversity in the SELECTION, and the VRP filter actively works
+# against it: it ranks on IV-RV, and richness clusters BY SECTOR because sector vol is bid
+# together. Measured 2026-08-10, the book held XOM and XLE simultaneously — and XLE HOLDS XOM,
+# so that is one position taken twice. Same selection pathology as the filter steering into the
+# widest spreads and the pre-earnings names.
+SECTOR = {
+    "SPY": "index", "QQQ": "index", "IWM": "index",
+    "NVDA": "tech", "AAPL": "tech",
+    "XLV": "health", "PFE": "health",
+    "XOM": "energy", "XLE": "energy",
+    "SBUX": "consumer", "MCD": "consumer",
+    "DE": "industrial", "CAT": "industrial",
+}
+
+# ETF / constituent overlap. A sector CAP does not catch this: XOM and XLE are both "energy",
+# so a cap of 2 admits both — yet XOM is ~22% of XLE, so that is ONE bet sized twice while
+# counting as two diversified positions. Holding a sector ETF and its major constituent at the
+# same time is a levered single-name bet wearing a diversification label.
+# SPY is deliberately NOT listed: it holds everything, but each single name is only ~2-7% of it,
+# so the overlap is immaterial and blocking it would cost the most liquid name in the basket.
+OVERLAP = {
+    "XLE": {"XOM"}, "XOM": {"XLE"},
+    "XLV": {"PFE"}, "PFE": {"XLV"},
+    "QQQ": {"AAPL", "NVDA"}, "AAPL": {"QQQ"}, "NVDA": {"QQQ"},
+}
+
 DEFAULT_BASKET = [
     "SPY", "QQQ", "IWM",          # index anchors (reliable, thin premium)
     "NVDA", "AAPL",               # tech (trimmed from 5 — rich only when tech vol is bid)
@@ -46,7 +74,15 @@ DEFAULT_BASKET = [
     "XOM", "XLE",                 # energy (rich VRP, negative corr to tech)
     "SBUX", "MCD",                # consumer (SBUX richest in screen; MCD defensive, neg corr)
     "DE", "CAT",                  # industrials
-    "TLT",                        # rates (different factor, uncorrelated)
+    # TLT REMOVED 2026-08-14 — structurally untradeable, not merely expensive. It trades ~$82 on
+    # a $1 strike grid at ~10.5% IV (the lowest in the basket, being a bond ETF), so the 16d and
+    # 10d legs land on ADJACENT strikes: a $1-wide spread yielding $10-13 of credit. The $2.60
+    # round-trip commission is then 20-26% of that BEFORE any bid-ask, and even the tightest
+    # possible penny-wide market adds another 8-10% -- over the 25% guard on every plausible
+    # combination. Unlike CAT (which fails on SPREAD and clears on a fatter-premium day), this is
+    # a FIXED cost that no execution improves; only TLT's own vol roughly doubling would rescue
+    # it (~30% IV gives a 2-wide spread, $26 credit, 9.9%). Rates exposure is forfeited; nothing
+    # else in the basket replaces that factor.
 ]
 
 
@@ -63,6 +99,11 @@ class OptionsConfig:
     budget: float = 100_000.0
     risk_per_trade: float = 0.03      # max loss per spread position ≤ 3% of budget (fits high-IV names)
     max_positions: int = 6
+    # Max simultaneous positions sharing a factor group (see SECTOR). Binds well before
+    # max_positions does: the VRP filter typically yields only 3-5 candidates, so without this
+    # a single rich sector can take most of the book. 2 leaves room for a genuine pair trade
+    # while stopping XOM+XLE (where one ETF literally holds the other single name).
+    max_per_sector: int = 2
     # Mechanical management (from the design work) — reduces the end-of-life gamma tail.
     profit_target: float = 0.50       # close when the spread can be bought back for ≤ 50% of entry credit
     # 0 = NO STOP (default since 2026-08-08). The long wing already caps the loss, and a stop

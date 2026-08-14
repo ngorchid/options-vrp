@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 from options_vrp import OptionsConfig, target_book  # noqa: E402
+from options_vrp.strategy import OVERLAP, SECTOR  # noqa: E402
 from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
@@ -344,10 +345,26 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             # One open position per ticker — never stack a 2nd spread on a name we already hold
             # (avoids concentrating idiosyncratic risk on one underlying).
             open_tickers = {sp.ticker for sp in state.open_spreads}
+            # Factor-group counts across ALREADY-OPEN spreads too, not just today's picks —
+            # otherwise the cap resets every run and the book concentrates over successive days.
+            from collections import Counter
+            sect_count = Counter(SECTOR.get(sp.ticker, sp.ticker) for sp in state.open_spreads)
             for s in res.targets:
                 if room <= 0:
                     break
                 if s.ticker in open_tickers:
+                    continue
+                # ETF/constituent overlap first: a sector cap does NOT catch it, since the two
+                # share a sector and so sit within the cap, yet one holds the other.
+                _clash = OVERLAP.get(s.ticker, set()) & open_tickers
+                if _clash:
+                    logging.info("SKIP %s — overlaps an open position (%s)",
+                                 s.ticker, ", ".join(sorted(_clash)))
+                    continue
+                _sect = SECTOR.get(s.ticker, s.ticker)
+                if sect_count[_sect] >= cfg.max_per_sector:
+                    logging.info("SKIP %s — already %d position(s) in %s (cap %d)",
+                                 s.ticker, sect_count[_sect], _sect, cfg.max_per_sector)
                     continue
                 sp = OpenSpread(s.ticker, s.expiry, s.short_strike, s.long_strike, s.contracts,
                                 s.credit, s.max_loss, today, s.spot)
@@ -394,7 +411,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 if fill["status"] in ("Filled", "Submitted", "PreSubmitted"):
                     credit = fill["net_price"] if fill["net_price"] is not None else s.credit
                     state.record_open(sp, credit, today)
-                    orders.append(fill); open_tickers.add(s.ticker); room -= 1
+                    orders.append(fill); open_tickers.add(s.ticker); sect_count[_sect] += 1; room -= 1
 
         # 3) mark, persist, email
         values = broker.spread_values(state.open_spreads)
