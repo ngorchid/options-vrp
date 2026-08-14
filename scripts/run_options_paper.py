@@ -349,7 +349,61 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             # otherwise the cap resets every run and the book concentrates over successive days.
             from collections import Counter
             sect_count = Counter(SECTOR.get(sp.ticker, sp.ticker) for sp in state.open_spreads)
-            for s in res.targets:
+            _ov_map = res.corr_overlap or OVERLAP
+
+            # Quotes are cached: the cheapest-of-group pass below needs the live combo quote to
+            # compare members, and the main loop needs the same quote to run the cost guard.
+            # Quoting twice would both waste calls and risk the two decisions disagreeing.
+            _qcache: dict[str, tuple] = {}
+
+            def _spread_of(t):
+                return OpenSpread(t.ticker, t.expiry, t.short_strike, t.long_strike, t.contracts,
+                                  t.credit, t.max_loss, today, t.spot)
+
+            def _quote_of(t):
+                if t.ticker not in _qcache:
+                    bid, ask = broker.quote_spread(_spread_of(t))
+                    ok, ratio, br = cost_ok(bid, ask, cfg.max_cost_frac,
+                                            cfg.commission_per_contract, cfg.option_multiplier)
+                    _qcache[t.ticker] = (bid, ask, ok, ratio, br)
+                return _qcache[t.ticker]
+
+            # CHEAPEST-OF-GROUP. Members of an overlap group are the same bet by construction, so
+            # the only thing separating them is execution cost — yet VRP rank decides which one
+            # claims the slot and blocks the rest. In simulation that left SPY, the cheapest name
+            # in the basket at 1.0% of credit, with FEWER fills than QQQ (1.9%) and IWM (5.4%).
+            # Sorting the members of each clashing group by measured cost is worth ~+0.29 capital
+            # Sharpe (scripts/vrp_basket_mc.py, algo_trading).
+            #
+            # This REORDERS rather than drops: the overlap check in the loop below still does the
+            # blocking, so if the cheapest member is rejected for some unrelated reason (risk
+            # check, no quote) the next-cheapest is still reachable. Ordering ACROSS groups is
+            # untouched and stays on VRP rank — cost only breaks ties between interchangeable
+            # names, it does not override the edge signal.
+            _targets = list(res.targets)
+            _pos = {t.ticker: i for i, t in enumerate(_targets)}
+            _seen: set[str] = set()
+            for _t in list(_targets):
+                if _t.ticker in _seen:
+                    continue
+                grp = [x for x in _targets
+                       if x.ticker == _t.ticker or x.ticker in _ov_map.get(_t.ticker, set())]
+                _seen.update(x.ticker for x in grp)
+                if len(grp) < 2:
+                    continue
+                slots = sorted(_pos[x.ticker] for x in grp)
+                # Unquotable members sort last so a missing quote never wins a slot on a 0 cost.
+                ranked = sorted(grp, key=lambda x: (_quote_of(x)[3] is None,
+                                                    _quote_of(x)[3] or 0.0))
+                if [x.ticker for x in ranked] != [_targets[i].ticker for i in slots]:
+                    logging.info("GROUP %s — cheapest first: %s", ", ".join(sorted(
+                        x.ticker for x in grp)), " < ".join(
+                        f"{x.ticker} {_quote_of(x)[3]:.0%}" if _quote_of(x)[3] is not None
+                        else f"{x.ticker} n/a" for x in ranked))
+                for slot, x in zip(slots, ranked):
+                    _targets[slot] = x
+
+            for s in _targets:
                 if room <= 0:
                     break
                 if s.ticker in open_tickers:
@@ -358,8 +412,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 # share a sector and so sit within the cap, yet one holds the other.
                 # Prefer the FRESH correlation map; fall back to the static holdings map only
                 # when there was too little history to compute one.
-                _ov = res.corr_overlap or OVERLAP
-                _clash = _ov.get(s.ticker, set()) & open_tickers
+                _clash = _ov_map.get(s.ticker, set()) & open_tickers
                 if _clash:
                     logging.info("SKIP %s — too correlated with an open position (%s)%s",
                                  s.ticker, ", ".join(sorted(_clash)),
@@ -377,9 +430,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 # EXECUTION COST GUARD — check the live COMBO quote before committing.
                 # Single-name option spreads run ~4x the index (measured 2026-08-08), which can
                 # eat 60% of the credit against a ~31% break-even. Reject rather than fill.
-                bid, ask = broker.quote_spread(sp)
-                ok, ratio, br = cost_ok(bid, ask, cfg.max_cost_frac,
-                                        cfg.commission_per_contract, cfg.option_multiplier)
+                bid, ask, ok, ratio, br = _quote_of(s)
                 if not ok:
                     if ratio is None:
                         msg = "no live quote"
