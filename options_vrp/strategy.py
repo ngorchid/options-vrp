@@ -60,6 +60,17 @@ SECTOR = {
 # same time is a levered single-name bet wearing a diversification label.
 # SPY is deliberately NOT listed: it holds everything, but each single name is only ~2-7% of it,
 # so the overlap is immaterial and blocking it would cost the most liquid name in the basket.
+# ⚠ STATIC — and measured 2026-08-14 to be BOTH incomplete and mis-targeted. It is retained
+# only as a fallback when the price panel is unavailable; `correlated_pairs()` below computes the
+# real thing each run. Two problems with the static approach:
+#   * IT GOES STALE. Sector-ETF compositions drift, constituents are reclassified, and the basket
+#     changes — a snapshot silently stops catching real overlaps and nothing complains.
+#   * HOLDINGS OVERLAP IS THE WRONG MEASURE ANYWAY. What matters for risk is whether two
+#     positions LOSE TOGETHER, and that is correlation, not weight. Measured over 2025-01..
+#     2026-08: the pairs this map blocks run 0.56-0.90 (AAPL/QQQ is only 0.56 despite AAPL being
+#     ~9% of QQQ), while the THREE HIGHEST pairs in the whole basket are index-vs-index and are
+#     NOT in this map at all — QQQ/SPY 0.95, IWM/SPY 0.86, IWM/QQQ 0.80. QQQ+SPY is a more
+#     duplicative pair than XOM+XLE, and the sector cap of 2 happily admits it.
 OVERLAP = {
     "XLE": {"XOM"}, "XOM": {"XLE"},
     "XLV": {"PFE"}, "PFE": {"XLV"},
@@ -104,6 +115,11 @@ class OptionsConfig:
     # a single rich sector can take most of the book. 2 leaves room for a genuine pair trade
     # while stopping XOM+XLE (where one ETF literally holds the other single name).
     max_per_sector: int = 2
+    # Daily-return correlation above which two names are treated as ONE position. 0.80 blocks the
+    # index anchors from pairing (SPY/QQQ 0.95, IWM/SPY 0.86, IWM/QQQ 0.80) as well as XLE/XOM
+    # (0.90) — all of which are the same bet twice. Deliberately does NOT block SBUX/MCD or
+    # DE/CAT, which are genuinely distinct names that happen to share a sector.
+    corr_overlap_thr: float = 0.80
     # Mechanical management (from the design work) — reduces the end-of-life gamma tail.
     profit_target: float = 0.50       # close when the spread can be bought back for ≤ 50% of entry credit
     # 0 = NO STOP (default since 2026-08-08). The long wing already caps the loss, and a stop
@@ -207,6 +223,37 @@ def pick_expiry(expiries: tuple[str, ...], today: pd.Timestamp,
             if best is None or abs(dte - mid) < abs(best[1] - mid):
                 best = (e, dte)
     return best
+
+
+def correlated_pairs(prices: pd.DataFrame, threshold: float = 0.80,
+                     window: int = 252) -> dict[str, set[str]]:
+    """{ticker -> set of tickers too correlated with it to hold simultaneously}.
+
+    Computed FRESH each run from the price panel the strategy already loads, so it cannot go
+    stale the way a hard-coded holdings map does — ETF compositions drift, names get
+    reclassified, and the basket itself changes.
+
+    Correlation rather than holdings weight, because the question is whether two positions LOSE
+    TOGETHER, which is what concentration costs you. Measured 2026-08-14 the two disagree
+    sharply: AAPL is ~9% of QQQ yet correlates only 0.56, while SPY/QQQ correlate 0.95 with
+    neither holding the other in any meaningful sense — they are simply the same bet.
+
+    Returns an empty map when there is too little history, so the caller falls back to OVERLAP
+    rather than silently dropping the check.
+    """
+    if prices is None or len(prices) < max(window // 4, 40):
+        return {}
+    r = prices.tail(window).pct_change(fill_method=None).dropna(how="all")
+    if len(r) < 30:
+        return {}
+    c = r.corr()
+    out: dict[str, set[str]] = {}
+    for a in c.columns:
+        peers = {b for b in c.columns
+                 if b != a and pd.notna(c.loc[a, b]) and c.loc[a, b] >= threshold}
+        if peers:
+            out[a] = peers
+    return out
 
 
 def earnings_cutoff(ticker: str, cfg: OptionsConfig,
@@ -330,6 +377,10 @@ class BookResult:
     regime_open: bool
     diagnostics: list[dict]        # per-name signal snapshot (for the dry-run table + IV recorder)
     targets: list[SpreadTarget]    # selected spreads (empty if gate shut)
+    # {ticker -> peers too correlated to hold alongside}, computed FRESH from this run's price
+    # panel. Empty when there is too little history, in which case the caller falls back to the
+    # static OVERLAP map rather than dropping the check.
+    corr_overlap: dict = field(default_factory=dict)
 
 
 def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookResult:
@@ -413,7 +464,8 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
                         len(bad_chains), checked_chains, ", ".join(bad_chains))
 
     candidates.sort(key=lambda s: s.vrp, reverse=True)
-    return BookResult(ratio, vix, open_, diags, candidates[: cfg.max_positions])
+    return BookResult(ratio, vix, open_, diags, candidates[: cfg.max_positions],
+                      correlated_pairs(prices, cfg.corr_overlap_thr))
 
 
 def cost_ok(bid: float | None, ask: float | None, max_frac: float,

@@ -356,10 +356,14 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                     continue
                 # ETF/constituent overlap first: a sector cap does NOT catch it, since the two
                 # share a sector and so sit within the cap, yet one holds the other.
-                _clash = OVERLAP.get(s.ticker, set()) & open_tickers
+                # Prefer the FRESH correlation map; fall back to the static holdings map only
+                # when there was too little history to compute one.
+                _ov = res.corr_overlap or OVERLAP
+                _clash = _ov.get(s.ticker, set()) & open_tickers
                 if _clash:
-                    logging.info("SKIP %s — overlaps an open position (%s)",
-                                 s.ticker, ", ".join(sorted(_clash)))
+                    logging.info("SKIP %s — too correlated with an open position (%s)%s",
+                                 s.ticker, ", ".join(sorted(_clash)),
+                                 "" if res.corr_overlap else " [static fallback]")
                     continue
                 _sect = SECTOR.get(s.ticker, s.ticker)
                 if sect_count[_sect] >= cfg.max_per_sector:
