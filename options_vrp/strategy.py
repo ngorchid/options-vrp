@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
 from . import data, signal
@@ -365,7 +366,11 @@ def build_spread(ticker: str, puts: pd.DataFrame, spot: float, expiry: str, dte:
     max_loss = width - credit
     if credit <= 0 or max_loss <= 0:
         return None
-    contracts = int((cfg.risk_per_trade * cfg.budget) // (max_loss * 100))
+    # max(..., 0): floor division on a negative budget returns a NEGATIVE contract count
+    # (-30 // 1100 == -1), i.e. an order to SELL -1 contracts. `allocated_budget` cannot currently
+    # go negative, but the sizer must not depend on that -- same defect class as the magic-formula
+    # negative-share bug found 2026-08-14.
+    contracts = max(int((cfg.risk_per_trade * cfg.budget) // (max_loss * 100)), 0)
     return SpreadTarget(ticker, expiry, dte, spot, iv, rv, signal.vrp(iv, rv),
                         short[0], long_[0], short[1], long_[1], credit, width, max_loss, contracts)
 
@@ -491,6 +496,13 @@ def cost_ok(bid: float | None, ask: float | None, max_frac: float,
     try:
         bid, ask = abs(float(bid)), abs(float(ask))
     except (TypeError, ValueError):
+        return False, None, empty
+    # NaN/inf must return ratio None, not a NaN ratio. Every NaN comparison below is False, so a
+    # NaN quote slipped past `mid <= 0` and `hi <= lo` and produced ratio=NaN. `ratio <= max_frac`
+    # is then False so it did skip -- but the CALLER branches on `ratio is None` to distinguish
+    # "no quote" from "quoted and too expensive", so a NaN was reported as `cost nan%` and did not
+    # honour skip_if_no_quote. Unusable input must look unusable.
+    if not (np.isfinite(bid) and np.isfinite(ask)):
         return False, None, empty
     lo, hi = min(bid, ask), max(bid, ask)
     mid = (lo + hi) / 2.0

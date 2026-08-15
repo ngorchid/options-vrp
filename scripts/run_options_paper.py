@@ -63,6 +63,28 @@ STATE_FILE = ROOT / "results" / "paper" / "state.json"
 # risk SPX does not, so its true vol is probably higher. Update if the basket, risk_per_trade or
 # max_positions changes materially.
 VOL_PRIOR = 0.063
+# Breaker sigmas for THIS sleeve, deliberately wider than the 1.2/2.0/2.8 default (decision
+# 2026-08-15, measured on the 13.2yr OPRA series: vol 6.26%, maxDD -11.27% = 1.80 sigma).
+#
+# THE MEASUREMENT: the breaker never improves this sleeve's drawdown AT ANY LEVEL -- maxDD stays
+# -11.27% under every configuration tested -- because `derisk` only halves exposure, and halving
+# once a drawdown is already 10% deep does not stop the remaining path to 11.27%. So every level
+# that fires is pure cost: the default sigmas cost -0.06 Sharpe, and REMOVING the vol floor (the
+# obvious "fix" for the floor overriding a legitimate 6.3% reading) makes it worse at -0.16,
+# because it lowers derisk to 7.5% and fires more often. Raising the sigmas costs 0.00.
+#
+# WHY NOT DROP lo=0.10 INSTEAD: the floor exists to stop a degenerate vol ESTIMATE turning the
+# breaker into a hair trigger, which is a real hazard for every sleeve. The problem here was
+# never the floor itself, it was that 1.2 x 6.26% = 7.5% sits below it, so the level was being
+# set by the floor rather than by this book's own risk. Setting sigmas that clear 1.80 sigma
+# fixes the cause: derisk lands at 12.5%, above the floor, so the floor no longer binds and the
+# level is a genuine multiple of measured vol again.
+#
+# A circuit breaker is an OPERATIONAL failsafe for "the model is broken", not a risk tool for
+# normal losses -- normal losses are handled by SIZING. For a book whose worst 13-year drawdown
+# is 1.80 sigma and slow, there is nothing for a drawdown trigger to catch, and it should sit
+# beyond the historical range so it only speaks when something is genuinely wrong.
+BREAKER_SIGMAS = (2.0, 2.6, 3.2)      # -> 12.5% / 16.3% / 20.0% at VOL_PRIOR
 # BASE CAPITAL is no longer set here. It is this sleeve's share of live account NetLiquidation,
 # from the validated table in risk_guard.ALLOCATIONS — see `allocated_budget`. The old hard-coded
 # $75,000 was chosen from the capital sweep against a $50k account, which meant three sleeves
@@ -347,7 +369,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         _peak = max(peak_equity(state.nav_history, _base), _eq)
         write_equity(ROOT.parent, "options-vrp", _eq, _peak)
         # Vol-scaled to this sleeve's own equity curve (nav_history here is TUPLES).
-        _lv = BreakerLevels.from_vol(blended_vol(state.nav_history, _base, VOL_PRIOR))
+        _lv = BreakerLevels.from_vol(blended_vol(state.nav_history, _base, VOL_PRIOR),
+                                     sigmas=BREAKER_SIGMAS)
         _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak, _lv)
         if _bwhy:
             (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
