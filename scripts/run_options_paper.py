@@ -129,7 +129,7 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
         logging.info("budget: %s", note)
     return OptionsConfig(
         budget=budget,
-        regime_thr=float(os.getenv("REGIME_THR", "1.00")),
+        regime_thr=float(os.getenv("REGIME_THR", "99")),   # 99 = gate off; see .env.example
         vrp_min=float(os.getenv("VRP_MIN", "0.02")),
         stop_mult=float(os.getenv("STOP_MULT", "0")),
         max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),
@@ -395,6 +395,13 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
 
         # 2) OPEN new spreads if the gate is open and we have room
         res = target_book(cfg)
+        # Logged in the LIVE path, not just dry_run: with the gate disabled via .env there is
+        # otherwise no way to confirm from a live run which state it is actually in, and a
+        # Windows .env still carrying REGIME_THR=1.00 would silently keep it on.
+        logging.info("regime: VIX/VIX3M %.3f vs thr %.2f -> gate %s", res.regime_ratio,
+                     cfg.regime_thr,
+                     "DISABLED (thr>=99)" if cfg.regime_thr >= 99 else
+                     ("OPEN" if res.regime_open else "SHUT — no new premium sold"))
         if res.regime_open:
             room = cfg.max_positions - len(state.open_spreads)
             # One open position per ticker — never stack a 2nd spread on a name we already hold
