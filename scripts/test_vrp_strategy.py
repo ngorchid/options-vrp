@@ -289,6 +289,45 @@ expect("too little history -> empty map (fall back to the static one), not a fal
        Check(correlated_pairs(prices.head(5), threshold=0.80) in ({}, {"SPY": set(), "QQQ": set(),
                                                                    "GLD": set()}), ""))
 
+# =====================================================================================
+print("\n--- stale prices: a frozen feed must not inflate VRP into a fake signal ---")
+print("    (data_fresh sees only the INDEX; RV20 collapsing makes VRP = IV - RV look RICH)")
+
+# The data layer is STUBBED because it is a collaborator (network IO), not the thing under
+# test -- target_book's stale handling is. Nothing about the stubs' behaviour is asserted.
+from options_vrp import data as _data, strategy as _strat  # noqa: E402
+
+_idx = pd.bdate_range(end=pd.Timestamp("2026-08-17"), periods=300)
+_rng = np.random.default_rng(11)
+_live = 100 * np.exp(np.cumsum(_rng.standard_normal(len(_idx)) * 0.012))
+_panel = pd.DataFrame({"SPY": _live, "QQQ": _live * 1.01,
+                       "FROZEN": np.full(len(_idx), 80.0)}, index=_idx)
+
+_orig = (_data.regime, _data.price_history, _data.option_expiries)
+try:
+    _data.regime = lambda: (0.90, 15.0, 16.7)
+    _data.price_history = lambda basket: _panel[[c for c in _panel.columns if c in basket]]
+    _data.option_expiries = lambda t: (None, ())          # no chains -> stop after the skip
+    _cfg_st = OptionsConfig(basket=("SPY", "QQQ", "FROZEN"), budget=75_000.0)
+    _res = _strat.target_book(_cfg_st, pd.Timestamp("2026-08-17"))
+finally:
+    _data.regime, _data.price_history, _data.option_expiries = _orig
+
+_notes = {d["ticker"]: d["note"] for d in _res.diagnostics}
+print(f"    diagnostics: {_notes}")
+expect("the FROZEN name is skipped with a stale-price note",
+       Check("stale price" in _notes.get("FROZEN", ""), f"{_notes}"))
+expect("  ... and never reaches the target book",
+       Check(all(t.ticker != "FROZEN" for t in _res.targets), f"{[t.ticker for t in _res.targets]}"))
+expect("  ... while the LIVE names are still processed (not a blanket halt)",
+       Check(all(n in _notes for n in ("SPY", "QQQ"))
+             and "stale price" not in _notes.get("SPY", ""), f"{_notes}"))
+expect("a frozen series really would have collapsed RV (so the skip is load-bearing)",
+       Check(float(_strat.signal.realized_vol(_panel["FROZEN"])) < 0.01,
+             f"rv {float(_strat.signal.realized_vol(_panel['FROZEN'])):.6f} — near-zero RV "
+             f"inflates VRP = IV - RV"))
+
+
 print("\n" + "=" * 96)
 if fails:
     print(f"{len(fails)} FAILURE(S) of {ran}:")

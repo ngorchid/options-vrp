@@ -75,6 +75,14 @@ MUTATIONS = [
      "    if current_value >= 2.0 * entry_credit:",
      "the removed 2x stop reinstated regardless of config"),
 
+    # --- stale prices (wired 2026-08-16) ---
+    ("        if tk_name in stale_px:",
+     "        if False:",
+     "stale-name skip removed (a frozen feed's inflated VRP becomes a trade)"),
+    ("        stale_px, _sc = stale_columns(prices[[c for c in prices.columns if c in cfg.basket]],",
+     "        stale_px, _sc = ({}, None) or stale_columns(prices[[c for c in prices.columns if c in cfg.basket]],",
+     "stale detection returns nothing (every name looks live)"),
+
     # --- LIQUIDITY SCREEN ---
     ("    if puts is None or \"openInterest\" not in getattr(puts, \"columns\", ()):",
      "    if puts is None:",

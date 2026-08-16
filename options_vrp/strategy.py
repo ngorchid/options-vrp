@@ -18,11 +18,12 @@ from .greeks import put_delta
 
 # risk_guard.py lives at the REPO ROOT, not in this package. The runner puts ROOT on sys.path.
 try:
-    from risk_guard import RiskLimits, chain_sane, data_fresh
+    from risk_guard import RiskLimits, chain_sane, data_fresh, stale_columns
 except ImportError:  # guard unavailable -> keep trading, just unscreened
     RiskLimits = None
     chain_sane = None
     data_fresh = None
+    stale_columns = None
 
 # Liquid, well-optioned basket spread across sectors (diversified 2026-07-29 from all-mega-cap-
 # tech, which meant a tech vol-spike hit every single name at once — and left the whole pool
@@ -405,12 +406,30 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
                                                    "rv": float("nan"), "iv": float("nan"),
                                                    "vrp": float("nan"), "expiry": None,
                                                    "dte": None, "note": _f.reason}], [])
+    # PER-NAME STALENESS. `data_fresh` above inspects only the panel INDEX, so one basket
+    # member whose feed dies or freezes leaves the panel current while that name's RV20
+    # collapses toward zero — which INFLATES its VRP (VRP = IV - RV) and makes it look like the
+    # richest name in the book. The cost guard cannot save us: it screens the quote, not the
+    # signal, so a bad VRP produces a well-executed trade on a false premise. Skipped, not
+    # halted: one dead ticker should not stop the other twelve.
+    stale_px: dict[str, int] = {}
+    if stale_columns is not None and RiskLimits is not None:
+        stale_px, _sc = stale_columns(prices[[c for c in prices.columns if c in cfg.basket]],
+                                      today, RiskLimits(budget=cfg.budget))
+        if stale_px:
+            logging.error("per-name staleness: %s — those names are SKIPPED today", _sc.reason)
+
     diags: list[dict] = []
     candidates: list[SpreadTarget] = []
     bad_chains: list[str] = []
     checked_chains = 0
     for tk_name in cfg.basket:
         if tk_name not in prices.columns:
+            continue
+        if tk_name in stale_px:
+            diags.append({"ticker": tk_name, "spot": float("nan"), "rv": float("nan"),
+                          "iv": float("nan"), "vrp": float("nan"), "expiry": None, "dte": None,
+                          "note": f"stale price ({stale_px[tk_name]}d since it last moved)"})
             continue
         spot = float(prices[tk_name].iloc[-1])
         rv = signal.realized_vol(prices[tk_name])
