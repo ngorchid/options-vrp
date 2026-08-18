@@ -30,6 +30,7 @@ from options_vrp.strategy import (  # noqa: E402
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
 from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+                        code_version,
                         check_allocations, check_order,
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
@@ -584,6 +585,10 @@ def main() -> None:
     # targets and the 21-DTE time stop still fire — but opens nothing new. Blocking management
     # would leave short options running into expiry unmanaged, which is worse than whatever
     # prompted the halt.
+    # Report WHICH COMMIT is running before anything else. Placed above the kill switch so it
+    # is recorded even on a halted run: "the box is running week-old code" is exactly the kind of
+    # thing you want to learn from a halted day's log, not discover a month later.
+    code_version(ROOT)
     _halt, _hwhy = halt_state(ROOT)
     if _halt == HALT_ALL:
         logging.error("HALTED (all): %s — exiting without trading. NOTE: profit targets and the "
