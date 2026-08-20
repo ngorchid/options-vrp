@@ -521,7 +521,11 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                                                      cfg.option_multiplier
                                                      for x in state.open_spreads))
                 if not chk:
-                    logging.warning("RISK REJECT %s", chk.reason)
+                    # Deferrable = spread too big for the CURRENT budget: expected, self-heals as
+                    # the book grows, so log at INFO not a daily WARNING alert. Genuine rejects stay
+                    # WARNING. (A reducing order is never rejected here — see check_order.)
+                    (logging.info if chk.deferrable else logging.warning)(
+                        "%s: %s", "RISK DEFER" if chk.deferrable else "RISK REJECT", chk.reason)
                     rejected.append({"ticker": sp.ticker, "reason": chk.reason,
                                      "bid": bid, "ask": ask, "ratio": ratio})
                     continue

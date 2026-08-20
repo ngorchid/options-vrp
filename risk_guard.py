@@ -35,6 +35,7 @@ import pandas as pd
 class Check:
     ok: bool
     reason: str = ""
+    deferrable: bool = False   # a size-cap reject that self-heals as the budget grows (expected, not an alert)
 
     def __bool__(self) -> bool:
         # bool() of the raw value, because Python REQUIRES __bool__ to return a real bool and
@@ -278,23 +279,34 @@ def check_order(ticker: str, side: str, qty: float, price: float, multiplier: fl
         return Check(False, f"{ticker}: non-positive/NaN price {price!r}")
 
     notional = abs(qty) * price * multiplier
-    if notional > limits.max_order_frac * limits.budget:
-        return Check(False, f"{ticker}: order ${notional:,.0f} = "
-                            f"{notional/limits.budget:.0%} of budget, over the "
-                            f"{limits.max_order_frac:.0%} single-order cap")
-
     after = abs(current_position_notional + (notional if side == "BUY" else -notional))
-    if after > limits.max_position_frac * limits.budget:
-        return Check(False, f"{ticker}: position would reach ${after:,.0f} = "
-                            f"{after/limits.budget:.0%} of budget, over the "
-                            f"{limits.max_position_frac:.0%} per-instrument cap")
-
-    gcap = limits.max_gross_frac if max_gross_frac is None else max_gross_frac
-    if gross_notional + notional > gcap * limits.budget:
-        return Check(False, f"{ticker}: gross would reach "
-                            f"${gross_notional + notional:,.0f} = "
-                            f"{(gross_notional+notional)/limits.budget:.1f}x budget, over the "
-                            f"{gcap:.1f}x cap")
+    # A position-REDUCING order (one that does not increase |exposure|) must NEVER be blocked by a
+    # size cap. A guard that blocks closes can trap a position it earlier allowed — after a budget
+    # cut, a rule change, or a position bought before the guard existed — leaving no way to close or
+    # roll it. Only exposure-GROWING orders are size-capped. (Forced/delivery closes are already
+    # exempt a level up in the callers; this also covers ordinary reduces.)
+    grows = after > abs(current_position_notional) + 1e-6
+    if grows:
+        # "deferrable" separates a reject caused by the INSTRUMENT being too big for the CURRENT
+        # budget -- even ONE contract exceeds the order cap, which self-heals as the book grows and
+        # should stay quiet -- from an oversized or buggy order (one unit fits, this order does not),
+        # which is a genuine fat-finger the guard exists to shout about. Marking every size reject
+        # deferrable would log a real sizing bug at INFO and miss it.
+        deferrable = abs(price * multiplier) > limits.max_order_frac * limits.budget
+        if notional > limits.max_order_frac * limits.budget:
+            return Check(False, f"{ticker}: order ${notional:,.0f} = "
+                                f"{notional/limits.budget:.0%} of budget, over the "
+                                f"{limits.max_order_frac:.0%} single-order cap", deferrable=deferrable)
+        if after > limits.max_position_frac * limits.budget:
+            return Check(False, f"{ticker}: position would reach ${after:,.0f} = "
+                                f"{after/limits.budget:.0%} of budget, over the "
+                                f"{limits.max_position_frac:.0%} per-instrument cap", deferrable=deferrable)
+        gcap = limits.max_gross_frac if max_gross_frac is None else max_gross_frac
+        if gross_notional + notional > gcap * limits.budget:
+            return Check(False, f"{ticker}: gross would reach "
+                                f"${gross_notional + notional:,.0f} = "
+                                f"{(gross_notional+notional)/limits.budget:.1f}x budget, over the "
+                                f"{gcap:.1f}x cap", deferrable=deferrable)
 
     if reference_price is not None and np.isfinite(reference_price) and reference_price > 0:
         dev = abs(price / reference_price - 1.0)

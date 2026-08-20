@@ -96,6 +96,18 @@ expect("1 ES @ $275k on a $1M futures book",
        check_order("ES", "BUY", 1, 5500.0, 50.0, RiskLimits.for_futures(1_000_000.0)), True)
 expect("futures book stays under the 3.3x gross backstop",
        check_order("MGC", "BUY", 1, 3000.0, 10.0, F, gross_notional=640_000), False)
+print("  -- reduce-exemption: a position-reducing order is NEVER size-capped --")
+_ZN = 108.0 * 1000                       # one full-size treasury contract's notional (~$108k)
+expect("OPEN 4 ZN from flat is rejected (too big for budget)",
+       check_order("ZN", "BUY", 4, 108.0, 1000.0, F, current_position_notional=0), False)
+expect("  ... rates reject IS deferrable (one ZN alone > order cap -> instrument too big)",
+       Check(check_order("ZN", "BUY", 4, 108.0, 1000.0, F, current_position_notional=0).deferrable), True)
+expect("  ... a fat-finger oversize is NOT deferrable (one unit fits -> loud WARNING)",
+       Check(not check_order("AAPL", "BUY", 3000, 305.0, 1.0, L).deferrable), True)
+expect("CLOSE 4 ZN (long +4 -> 0) is ALLOWED (reduce, never capped)",
+       check_order("ZN", "SELL", 4, 108.0, 1000.0, F, current_position_notional=4 * _ZN), True)
+expect("GROW +4 ZN (long +4 -> +8) is rejected (increases exposure)",
+       check_order("ZN", "BUY", 4, 108.0, 1000.0, F, current_position_notional=4 * _ZN), False)
 print("  -- options: 100x multiplier --")
 O = RiskLimits.for_options(100_000.0)
 expect("2 SPY spreads @ $4.40 x 100", check_order("SPY", "SELL", 2, 4.40, 100.0, O), True)
