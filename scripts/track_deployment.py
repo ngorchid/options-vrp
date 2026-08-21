@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -37,6 +38,7 @@ sys.path.insert(0, str(ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
 from options_vrp import OptionsConfig, target_book  # noqa: E402
+from risk_guard import NOMINAL_NAV, allocated_budget  # noqa: E402
 from options_vrp.strategy import OVERLAP, SECTOR  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -121,7 +123,15 @@ def main() -> None:
     if a.report:
         report()
         return
-    row = observe(OptionsConfig())
+    # SAME BUDGET AS LIVE. The tracker exists to predict what the live book will deploy, and
+    # whole-contract rounding is budget-dependent -- a name that fits one contract at $75k may
+    # fit none at $50k. Measuring at the OptionsConfig default while the runner sizes off
+    # `allocated_budget` would produce a deployment rate for a book that does not exist.
+    _b, _note = allocated_budget("options-vrp", None,
+                                 float(os.getenv("NOMINAL_NAV", str(NOMINAL_NAV))))
+    _b = float(os.getenv("BUDGET", _b))
+    logging.info("tracking at budget $%s (%s)", f"{_b:,.0f}", _note)
+    row = observe(OptionsConfig(budget=_b))
     OUT.parent.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(OUT) if OUT.exists() else pd.DataFrame()
     df = df[df["date"] != row["date"]] if "date" in df else df       # idempotent per day
