@@ -36,6 +36,14 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# The daily task redirects stdout to a log; on Windows that defaults to cp1252, which cannot encode
+# the report's unicode (the ⚠ / — / → characters) and crashed --report with UnicodeEncodeError once
+# there were <10 observations. Force UTF-8 so the summary always prints.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:  # noqa: BLE001 - some stdout wrappers lack reconfigure; harmless
+    pass
+
 from dotenv import load_dotenv  # noqa: E402
 from options_vrp import OptionsConfig, target_book  # noqa: E402
 from risk_guard import NOMINAL_NAV, allocated_budget  # noqa: E402
