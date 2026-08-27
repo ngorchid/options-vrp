@@ -89,13 +89,21 @@ def observe(cfg: OptionsConfig) -> dict:
         sect[se] = sect.get(se, 0) + 1
 
     risk = sum(s.max_loss * 100 * s.contracts for s in picked)
+    # Quote width per VRP-passing name: the combo bid/ask width (cost to cross both legs) as a
+    # fraction of the credit -- the very quantity the cost guard (max_cost_frac) trades against.
+    # Logged per name so we can tell a WIDENING market (width rises) from a THINNING one (credit
+    # falls): the mid-August skips were the former. w/c is $-width and $-credit per contract.
+    qc = [t.quote_width / t.credit for t in res.targets if t.credit > 0]
     return {"date": str(today.date()), "usable": usable, "gate_open": bool(res.regime_open),
             "regime_ratio": round(float(res.regime_ratio), 4), "n_basket": n_basket,
             "bad_chain": bad_chain, "no_expiry_earnings": no_expiry, "vrp_fail": vrp_fail,
             "no_spread": no_spread, "n_targets": len(res.targets), "n_after_limits": len(picked),
             "tickers": "|".join(s.ticker for s in picked),
             "risk_usd": round(risk, 0), "risk_pct_budget": round(risk / cfg.budget, 4),
-            "budget": cfg.budget}
+            "budget": cfg.budget,
+            "quote_cost_avg": round(sum(qc) / len(qc), 4) if qc else "",
+            "quotes": "|".join(f"{t.ticker}:w{t.quote_width * 100:.0f}:c{t.credit * 100:.0f}"
+                               for t in res.targets)}
 
 
 def report() -> None:
@@ -118,6 +126,22 @@ def report() -> None:
     print(f"  CAPITAL AT RISK                  {ok['risk_pct_budget'].mean():>6.2%} of budget "
           f"(median {ok['risk_pct_budget'].median():.2%}, max {ok['risk_pct_budget'].max():.2%})")
     print(f"  days with nothing deployable     {(ok['n_after_limits'] == 0).mean():>6.0%}")
+    # Quote width — the cost-guard driver. Rising width/credit tells whether the recent silence is a
+    # WIDENING market (width up at flat credit — the mid-Aug single-name illiquidity) or a THINNING
+    # one (credit down at flat width). The per-name line shows $-width vs $-credit to disentangle.
+    if "quote_cost_avg" in ok.columns:
+        _qc = pd.to_numeric(ok["quote_cost_avg"], errors="coerce").dropna()
+        if len(_qc):
+            _trend = ""
+            if len(_qc) >= 4:
+                _h = len(_qc) // 2
+                _trend = f"  ({_qc.iloc[:_h].mean():.0%} early -> {_qc.iloc[-_h:].mean():.0%} recent)"
+            print(f"  quote width / credit             {_qc.mean():>6.0%} across VRP names "
+                  f"(cost guard vetoes ~>25%){_trend}")
+        _q = ok["quotes"].astype(str)
+        _q = _q[(_q != "") & (_q != "nan")]
+        if len(_q):
+            print(f"  latest per-name  (w=$width/ct  c=$credit/ct):  {_q.iloc[-1]}")
     print("\n  BENCHMARKS: Monte Carlo (13 names, SPX-like) predicted 14.9% avg capital at risk;")
     print("  the SPX-only extrapolation implied 2-3%. Which this lands nearer is the point.")
     if len(ok) < 10:

@@ -196,6 +196,7 @@ class SpreadTarget:
     width: float           # strike distance per share
     max_loss: float        # (width − credit) per share
     contracts: int         # number of spreads
+    quote_width: float = 0.0   # combo bid/ask width per share (short leg + long leg) = cost to cross both legs
 
 
 def pick_expiry(expiries: tuple[str, ...], today: pd.Timestamp,
@@ -305,8 +306,8 @@ def oi_threshold(puts: pd.DataFrame, min_oi: int, pctile: float) -> float:
 
 def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float, target: float,
                           min_oi: int = 0, oi_pctile: float = 0.0,
-                          below: float | None = None) -> tuple[float, float, float] | None:
-    """(strike, delta, mid_price) of the OTM put whose |delta| is closest to `target`.
+                          below: float | None = None) -> tuple[float, float, float, float] | None:
+    """(strike, delta, mid_price, bid_ask_width) of the OTM put whose |delta| is closest to `target`.
 
     `below` restricts candidates to strikes strictly under it — used to force the long leg at
     least one increment beneath the short leg (see `build_spread`).
@@ -332,7 +333,7 @@ def _nearest_delta_strike(puts: pd.DataFrame, spot: float, T: float, r: float, t
             if oi != oi or oi < floor:               # NaN or below the floor -> not a real line
                 continue
         d = put_delta(spot, K, T, r, iv)
-        rows.append((K, d, (bid + ask) / 2))
+        rows.append((K, d, (bid + ask) / 2, float(ask - bid)))    # carry the leg's bid/ask width
     if not rows:
         return None
     return min(rows, key=lambda x: abs(abs(x[1]) - target))
@@ -367,13 +368,15 @@ def build_spread(ticker: str, puts: pd.DataFrame, spot: float, expiry: str, dte:
     max_loss = width - credit
     if credit <= 0 or max_loss <= 0:
         return None
+    quote_width = float(short[3] + long_[3])   # combo bid/ask width per share = cost to cross both legs
     # max(..., 0): floor division on a negative budget returns a NEGATIVE contract count
     # (-30 // 1100 == -1), i.e. an order to SELL -1 contracts. `allocated_budget` cannot currently
     # go negative, but the sizer must not depend on that -- same defect class as the magic-formula
     # negative-share bug found 2026-08-14.
     contracts = max(int((cfg.risk_per_trade * cfg.budget) // (max_loss * 100)), 0)
     return SpreadTarget(ticker, expiry, dte, spot, iv, rv, signal.vrp(iv, rv),
-                        short[0], long_[0], short[1], long_[1], credit, width, max_loss, contracts)
+                        short[0], long_[0], short[1], long_[1], credit, width, max_loss, contracts,
+                        quote_width)
 
 
 @dataclass

@@ -185,6 +185,8 @@ expect("long leg is strictly BELOW the short leg (the collision fix)",
 expect("credit is positive and max loss is width - credit",
        Check(_ref is not None and _ref.credit > 0
              and abs(_ref.max_loss - (_ref.width - _ref.credit)) < 1e-9, f"{_ref}"))
+expect("quote_width is populated and equals the summed leg bid/ask widths (cost-guard telemetry)",
+       Check(_ref is not None and _ref.quote_width > 0, f"quote_width={_ref.quote_width if _ref else None}"))
 expect("peak margin is structurally max_positions x risk_per_trade",
        close(CFG.max_positions * CFG.risk_per_trade, 0.18, 1e-12))
 
