@@ -44,6 +44,13 @@ class OptionsState:
     # One day stale is immaterial: the budget is quantised to 10% steps. 0.0 = never seen, and
     # `allocated_budget` then falls back to the nominal share and says so in the log.
     last_net_liq: float = 0.0
+    # Orders placed but NOT confirmed terminal within the poll window. IB caps combo MARKET orders
+    # at a regulatory limit, so they fill in pieces over ~15-40s -- sometimes after the run's poll
+    # gives up, or after the run ends. Each pending order is resolved at the START of the next run
+    # against the REAL IB position (source of truth), so a late CLOSE is booked and a late/failed
+    # OPEN is corrected -- instead of the ledger drifting into a phantom/orphan. Each entry:
+    #   {action: "open"|"close", permId: int, spread: {..OpenSpread fields..}, placed_date: "Y-M-D"}
+    pending_orders: list = field(default_factory=list)
 
     # --- persistence ---
     @classmethod

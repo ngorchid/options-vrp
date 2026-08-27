@@ -127,10 +127,11 @@ class OptionsBroker:
                 break
         st = trade.orderStatus.status
         fp = trade.orderStatus.avgFillPrice or None
+        perm = int(getattr(trade.order, "permId", 0) or 0)   # stable across runs; lets a late fill be resolved
         logging.info("%s %dx %s %g/%gp -> %s%s", "OPEN" if opening else "CLOSE",
                      sp.contracts, sp.ticker, sp.short_strike, sp.long_strike, st,
                      f" @ {fp}" if fp else "")
-        return {**base, "net_price": abs(float(fp)) if fp else None, "status": st}
+        return {**base, "net_price": abs(float(fp)) if fp else None, "status": st, "permId": perm}
 
     def quote_spread(self, sp: OpenSpread, wait: float = 3.0) -> tuple[float | None, float | None]:
         """Live BID/ASK for the vertical as a COMBO.
@@ -171,6 +172,27 @@ class OptionsBroker:
 
     def close_spread(self, sp: OpenSpread, wait: float = 45.0) -> dict:
         return self._combo_order(sp, opening=False, wait=wait)
+
+    def order_fill(self, perm_id) -> tuple[str, float] | None:
+        """(status, avg_fill_price) for a previously-placed order by permId, or None.
+
+        Pulls open AND completed orders so an order that reached a terminal state AFTER a prior
+        run's poll gave up can still be found on the next run. avg_fill_price is the combo per-share
+        fill (unsigned); 0.0 if not yet filled. Used by the pending-order self-heal — never trusts
+        anything but THIS strategy's own orders (matched by permId)."""
+        if self.dry_run or self.ib is None or not perm_id:
+            return None
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.reqCompletedOrders(False)
+            self.ib.sleep(1.0)
+            for t in self.ib.trades():
+                if int(getattr(t.order, "permId", 0) or 0) == int(perm_id):
+                    fp = t.orderStatus.avgFillPrice
+                    return (t.orderStatus.status, abs(float(fp)) if fp else 0.0)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("order_fill(%s) failed: %s", perm_id, e)
+        return None
 
     # --- marks (from portfolio feed; no market-data sub needed) ---
     def put_positions(self) -> dict[tuple, float] | None:

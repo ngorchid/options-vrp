@@ -14,6 +14,7 @@ import argparse
 import logging
 import os
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -293,6 +294,65 @@ def selftest(cfg: OptionsConfig) -> None:
               f"{f'{got[0]} ({got[1]}d)' if got else 'SKIP'}   {note}")
 
 
+def _resolve_pending(broker, state, today: str) -> None:
+    """Book / reverse orders that hadn't reached a terminal state when a prior run's poll gave up.
+
+    IB caps combo MARKET orders, so they can fill up to ~40s after placement -- sometimes after the
+    run ended -- and the poll then logged "not filled" without booking. Here, at the START of the
+    next run, each pending order is checked against the REAL IB position (source of truth) plus the
+    order's own fill: a late CLOSE that IB now shows flat is booked; a late OPEN that IB shows held
+    is booked; an OPEN that never filled is reversed. Runs BEFORE management, so a spread already
+    closed at IB is removed before the manage loop could place a close on a position that is not
+    there (which would OPEN a short spread). Only touches THIS strategy's own orders (matched by
+    permId / its own tracked spread), so it cannot adopt or clobber another strategy's position on
+    the shared account -- the reason the general reconcile stays report-only."""
+    pend = getattr(state, "pending_orders", None)
+    if not pend:
+        return
+    actual = broker.put_positions()
+    if actual is None:
+        logging.warning("pending: IB positions unavailable — %d order(s) left for next run", len(pend))
+        return
+    from options_vrp.broker import _ib_expiry
+    from options_vrp.state import OpenSpread
+    still: list = []
+    for p in pend:
+        sp = OpenSpread(**p["spread"])
+        e = _ib_expiry(sp.expiry)
+        held = (abs(actual.get((sp.ticker, e, float(sp.short_strike)), 0.0)) >= 1e-9 or
+                abs(actual.get((sp.ticker, e, float(sp.long_strike)), 0.0)) >= 1e-9)
+        info = broker.order_fill(p.get("permId"))                 # (status, avg_fill) or None
+        age = (pd.Timestamp(today) - pd.Timestamp(p.get("placed_date", today))).days
+        if p["action"] == "close":
+            if held:
+                logging.info("pending CLOSE %s still open at IB — resuming normal management", sp.key)
+            elif state.has(sp.key):                               # legs flat at IB -> the close filled
+                price = info[1] if (info and info[1]) else broker.spread_values([sp]).get(sp.key)
+                if price is None:
+                    price = sp.entry_credit                       # last resort: breakeven, flagged
+                pnl = state.record_close(sp, float(price), today,
+                    f"self-heal: CLOSE filled at IB after the poll returned; booked at "
+                    f"{'fill' if (info and info[1]) else 'mark/breakeven'} {float(price):.4f}")
+                logging.warning("self-heal: booked late CLOSE %s @ %.4f (pnl %.2f)",
+                                sp.key, float(price), pnl)
+        else:  # open
+            if held:                                              # open filled
+                if not state.has(sp.key):
+                    credit = info[1] if (info and info[1]) else sp.entry_credit
+                    state.record_open(sp, float(credit), today)
+                    logging.warning("self-heal: booked late OPEN %s @ %.4f", sp.key, float(credit))
+            elif age >= 1:                                        # never filled -> reverse optimistic booking
+                if state.has(sp.key):
+                    state.open_spreads = [s for s in state.open_spreads if s.key != sp.key]
+                    logging.warning("self-heal: OPEN %s never filled at IB — removed optimistic booking",
+                                    sp.key)
+            else:
+                still.append(p)                                   # same-day, may still fill: keep one run
+    if len(still) != len(pend):
+        logging.info("pending: resolved %d, %d still open", len(pend) - len(still), len(still))
+    state.pending_orders = still
+
+
 # ---------- live ----------
 def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
     from options_vrp.broker import OptionsBroker
@@ -328,6 +388,11 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         elif 0 < _mscale < 1.0:
             cfg.risk_per_trade *= _mscale
 
+        # 0) RESOLVE PENDING — book/reverse any order that filled after a prior run's poll gave up,
+        # BEFORE managing, so a spread already closed at IB is gone before the manage loop could try
+        # to re-close a position that is not there. This is the self-heal for the combo-fill race.
+        _resolve_pending(broker, state, today)
+
         # 1) MANAGE open spreads
         values = broker.spread_values(state.open_spreads)
         for sp in list(state.open_spreads):
@@ -351,9 +416,13 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                     pnl = state.record_close(sp, fill["net_price"], today, action)
                     orders.append({**fill, "pnl": pnl, "reason": action})
                 else:
-                    logging.warning("close for %s NOT filled (status=%s) — left open to retry",
+                    logging.warning("close for %s NOT filled (status=%s) — left open, pending self-heal",
                                     sp.key, fill["status"])
                     orders.append({**fill, "pnl": None, "reason": f"{action} (unfilled)"})
+                    # Track it: if the capped combo fills after this poll, the next run books it
+                    # from the real IB fill instead of leaving a phantom (the 2026-08-21 SBUX case).
+                    state.pending_orders.append({"action": "close", "permId": fill.get("permId", 0),
+                                                 "spread": asdict(sp), "placed_date": today})
 
         # CIRCUIT BREAKER — here, AFTER management, so it can see UNREALISED P&L from the live
         # marks just fetched. Realised-only was blind to exactly the drawdowns that matter: a
@@ -534,6 +603,11 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                     credit = fill["net_price"] if fill["net_price"] is not None else s.credit
                     state.record_open(sp, credit, today)
                     orders.append(fill); open_tickers.add(s.ticker); sect_count[_sect] += 1; room -= 1
+                    if fill["status"] != "Filled":
+                        # Booked optimistically off a non-terminal status. Track it so the next run
+                        # confirms it actually filled at IB, and reverses the booking if it did not.
+                        state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),
+                                                     "spread": asdict(sp), "placed_date": today})
 
         # 3) mark, persist, email
         values = broker.spread_values(state.open_spreads)

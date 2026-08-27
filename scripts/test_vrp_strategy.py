@@ -328,6 +328,47 @@ expect("a frozen series really would have collapsed RV (so the skip is load-bear
              f"inflates VRP = IV - RV"))
 
 
+print("\n--- self-heal: pending orders resolved against the real IB position on the next run ---")
+sys.path.insert(0, str(ROOT / "scripts"))
+from dataclasses import asdict as _asdict                                     # noqa: E402
+from run_options_paper import _resolve_pending                               # noqa: E402
+from options_vrp.state import OptionsState, OpenSpread                        # noqa: E402
+
+
+def _mkS(t, ss, ls, cr, ct):
+    return OpenSpread(t, "2026-09-11", ss, ls, ct, cr, 4.0, "2026-08-07", 100.0, 0.0)
+
+
+_sbux, _tlt, _xom, _cat = (_mkS("SBUX", 99, 95, 0.18, 8), _mkS("TLT", 80, 79, 0.10, 5),
+                           _mkS("XOM", 145, 140, 0.30, 6), _mkS("CAT", 715, 685, 0.25, 1))
+_st = OptionsState()
+_st.open_spreads = [_sbux, _tlt, _cat]                       # xom not booked yet; cat booked optimistically
+_st.pending_orders = [
+    {"action": "close", "permId": 101, "spread": _asdict(_sbux), "placed_date": "2026-08-26"},  # filled -> book
+    {"action": "close", "permId": 102, "spread": _asdict(_tlt), "placed_date": "2026-08-26"},   # still open -> leave
+    {"action": "open", "permId": 103, "spread": _asdict(_xom), "placed_date": "2026-08-26"},     # filled -> book
+    {"action": "open", "permId": 104, "spread": _asdict(_cat), "placed_date": "2026-08-26"}]     # never filled -> reverse
+_E = "20260911"
+_pos = {("TLT", _E, 80.0): -5, ("TLT", _E, 79.0): 5, ("XOM", _E, 145.0): -6, ("XOM", _E, 140.0): 6}
+_fills = {101: ("Filled", 0.40), 102: ("Submitted", 0.0), 103: ("Filled", 0.30), 104: ("Cancelled", 0.0)}
+
+
+class _FakeBroker:
+    dry_run = False
+    def put_positions(self): return dict(_pos)
+    def order_fill(self, p): return _fills.get(p)
+    def spread_values(self, sp): return {}
+
+
+_resolve_pending(_FakeBroker(), _st, "2026-08-27")
+_tk = sorted(s.ticker for s in _st.open_spreads)
+expect("late CLOSE booked (SBUX filled at IB) -> -176 realized", close(_st.realized_pnl, -176.0, 0.01))
+expect("still-open CLOSE left alone (TLT held at IB)", Check("TLT" in _tk))
+expect("late OPEN booked (XOM filled at IB)", Check("XOM" in _tk))
+expect("OPEN that never filled reversed (CAT flat at IB)", Check("CAT" not in _tk))
+expect("resolved pendings cleared", Check(len(_st.pending_orders) == 0))
+
+
 print("\n" + "=" * 96)
 if fails:
     print(f"{len(fails)} FAILURE(S) of {ran}:")
