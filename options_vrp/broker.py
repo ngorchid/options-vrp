@@ -161,10 +161,15 @@ class OptionsBroker:
             logging.warning("no combo quote for %s: %r", sp.key, exc)
             return None, None
 
-    def open_spread(self, sp: OpenSpread, wait: float = 20.0) -> dict:
+    # 45s, not 20s: IB caps combo MARKET orders at a regulatory limit, so they fill like limit
+    # orders — in pieces across venues as the market comes to the cap. On 2026-08-21 an 8-lot SBUX
+    # close completed at ~20.2s, a hair past the old 20s poll, so it logged "not filled" and was
+    # never booked while IB had closed it -> a PHANTOM. The poll still returns the instant the order
+    # fills, so fast names are unaffected; this only widens the window for slow capped combos.
+    def open_spread(self, sp: OpenSpread, wait: float = 45.0) -> dict:
         return self._combo_order(sp, opening=True, wait=wait)
 
-    def close_spread(self, sp: OpenSpread, wait: float = 20.0) -> dict:
+    def close_spread(self, sp: OpenSpread, wait: float = 45.0) -> dict:
         return self._combo_order(sp, opening=False, wait=wait)
 
     # --- marks (from portfolio feed; no market-data sub needed) ---
