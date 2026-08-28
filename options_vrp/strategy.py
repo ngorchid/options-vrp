@@ -52,8 +52,9 @@ SECTOR = {
     "NVDA": "tech", "AAPL": "tech",
     "XLV": "health", "PFE": "health",
     "XOM": "energy", "XLE": "energy",
-    "SBUX": "consumer", "MCD": "consumer",
+    "SBUX": "consumer", "MCD": "consumer", "NKE": "consumer",
     "DE": "industrial", "CAT": "industrial",
+    "BAC": "financials",
 }
 
 # ETF / constituent overlap. A sector CAP does not catch this: XOM and XLE are both "energy",
@@ -87,6 +88,19 @@ DEFAULT_BASKET = [
     "XOM", "XLE",                 # energy (rich VRP, negative corr to tech)
     "SBUX", "MCD",                # consumer (SBUX richest in screen; MCD defensive, neg corr)
     "DE", "CAT",                  # industrials
+    "NKE",                        # consumer (added 2026-08-28)
+    "BAC",                        # financials (added 2026-08-28) — the basket had NO financials
+    # NKE and BAC added from the 2026-08-28 market-hours screen, which was the first one to
+    # measure COST alongside VRP. Both cleared all three filters on that snapshot: NKE VRP
+    # +10.7% / corr +0.27 / cost 23%, BAC VRP +6.2% / corr +0.37 / cost 18% (corr measured
+    # against the basket's own returns, so these are genuine diversifiers rather than another
+    # index proxy). BAC is the more valuable of the two: financials was an entirely absent
+    # factor group, whereas NKE only deepens the consumer bench behind the cap of 2.
+    # ⚠ ONE SNAPSHOT, which normally is not enough to act on. The asymmetry is what makes it
+    # acceptable HERE: adding a candidate is reversible and still has to clear the VRP, cost
+    # and correlation guards on the day it would actually trade, so a bad addition simply
+    # never opens. PRUNING on one snapshot is what destroys information -- see the 2026-08-08
+    # weekend screen that condemned 8 names later shown to pass on market-hours combo quotes.
     # TLT REMOVED 2026-08-14 — structurally untradeable, not merely expensive. It trades ~$82 on
     # a $1 strike grid at ~10.5% IV (the lowest in the basket, being a bond ETF), so the 16d and
     # 10d legs land on ADJACENT strikes: a $1-wide spread yielding $10-13 of credit. The $2.60
