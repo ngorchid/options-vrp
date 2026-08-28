@@ -107,7 +107,18 @@ class OptionsConfig:
     short_delta: float = 0.16         # short put ≈ 1σ
     long_delta: float = 0.10          # long put (defined-risk wing); nearer = narrower spread
     dte_min: int = 30
-    dte_max: int = 45
+    # 45 -> 50 on 2026-08-28. Single names and sector ETFs carry usable open interest only on
+    # the MONTHLY (3rd-Friday) expiries; the weeklies between them are near-dead (XOM measured
+    # that day: 92,654 contracts of put OI on the 21-DTE monthly vs 799 on the 35-DTE weekly
+    # the 30-45 window forced it to select -- only 5 strikes cleared the OI floor, so
+    # build_spread returned None and EVERY single name failed while SPY/QQQ/NVDA traded).
+    # Monthlies are 28-35 days apart and the window is narrower than that gap, so it can never
+    # hold two and there are structural blackouts. Over 2020-2026 business days a monthly sits
+    # inside 30-45 on only 55% of days (dark runs mean 9.6d, max 13d); 30-50 raises that to 69%.
+    # ⚠ NOT backtested. The OPRA walk-forward that validated 30-45 ran on SPX, which has deep
+    # weeklies, so it is blind to this failure mode entirely -- it cannot justify 45 OR 50. 50
+    # is still ordinary short-premium territory and the change is one character to revert.
+    dte_max: int = 50
     rate: float = 0.04                # risk-free for delta calc
     budget: float = 75_000.0   # risk base, not cash; see BASE_BUDGET in run_options_paper
     risk_per_trade: float = 0.03      # max loss per spread position ≤ 3% of budget (fits high-IV names)

@@ -101,9 +101,46 @@ def observe(cfg: OptionsConfig) -> dict:
             "tickers": "|".join(s.ticker for s in picked),
             "risk_usd": round(risk, 0), "risk_pct_budget": round(risk / cfg.budget, 4),
             "budget": cfg.budget,
+            "monthly_avail": monthly_in_window(today, cfg)[0],
+            "dte_next_monthly": monthly_in_window(today, cfg)[1],
             "quote_cost_avg": round(sum(qc) / len(qc), 4) if qc else "",
             "quotes": "|".join(f"{t.ticker}:w{t.quote_width * 100:.0f}:c{t.credit * 100:.0f}"
                                for t in res.targets)}
+
+
+def monthly_in_window(today, cfg) -> tuple[int, int]:
+    """(monthly_available, dte_to_nearest_monthly) for the CURRENT DTE window.
+
+    WHY THIS IS LOGGED. Single names and sector ETFs carry real open interest only on the
+    MONTHLY (3rd-Friday) expiries; the weeklies between them are near-dead. Measured
+    2026-08-28: XOM had 92,654 contracts of put OI on the 21-DTE monthly and 799 on the
+    35-DTE weekly the strategy actually selected, so only 5 strikes cleared the OI floor and
+    `build_spread` returned None. Every single name failed that way while SPY/QQQ/NVDA (deep
+    OI on every expiry) traded normally.
+
+    Monthlies are 28-35 days apart and the DTE window is ~16-21 days wide, so it can never
+    hold two -- there are structural blackouts. Measured over 2020-2026 business days, a
+    monthly sits inside dte 30-45 on only 55% of days, in dark runs averaging 9.6d (max 13d);
+    at 30-50 that rises to 69%.
+
+    This matters for attribution, not just curiosity: `quote_cost_avg` CANNOT see this failure
+    mode, because a name with no usable strikes never produces a quote at all. Without this
+    column a calendar blackout and a genuinely widening market look identical in the log.
+    """
+    import pandas as _pd
+    d = _pd.Timestamp(today).normalize()
+    monthlies = []
+    for m in _pd.date_range(d - _pd.Timedelta(days=40), d + _pd.Timedelta(days=120), freq="MS"):
+        off = (4 - m.weekday()) % 7                      # first Friday, then +14 -> third
+        monthlies.append(m + _pd.Timedelta(days=off + 14))
+    dtes = sorted((x - d).days for x in monthlies if (x - d).days >= 0)
+    if not dtes:
+        return 0, -1
+    inside = [x for x in dtes if cfg.dte_min <= x <= cfg.dte_max]
+    # Report the monthly that would actually be TRADED when one is in range; only fall back
+    # to the nearest (which is then out of range) so the column shows where in the cycle we
+    # are during a blackout.
+    return (1, int(inside[0])) if inside else (0, int(dtes[0]))
 
 
 def report() -> None:
