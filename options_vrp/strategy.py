@@ -210,10 +210,38 @@ class SpreadTarget:
     quote_width: float = 0.0   # combo bid/ask width per share (short leg + long leg) = cost to cross both legs
 
 
+def is_monthly(ts: pd.Timestamp) -> bool:
+    """True for a standard 3rd-Friday monthly expiry.
+
+    Third Friday, not "the Friday in week 3": the month can start on a Friday, so this counts
+    from the first Friday and adds 14 days rather than indexing by week number.
+    """
+    ts = pd.Timestamp(ts)
+    first = ts.replace(day=1)
+    third_friday = first + pd.Timedelta(days=(4 - first.weekday()) % 7 + 14)
+    return ts.normalize() == third_friday.normalize()
+
+
 def pick_expiry(expiries: tuple[str, ...], today: pd.Timestamp,
                 dte_min: int, dte_max: int,
                 before: pd.Timestamp | None = None) -> tuple[str, int] | None:
-    """Choose the expiry whose DTE lands in [min,max], nearest the window midpoint.
+    """Choose an expiry in [min,max]: a MONTHLY if one qualifies, else nearest the midpoint.
+
+    MONTHLY-FIRST (2026-08-28). Single names and sector ETFs carry usable open interest only
+    on the 3rd-Friday monthlies; the weeklies between them are near-dead. Measured that day
+    during market hours: XOM had 92,654 contracts of put OI on the 21-DTE monthly against 799
+    on the 35-DTE weekly the midpoint rule selected, so only 5 strikes cleared the OI floor,
+    `_nearest_delta_strike` found no legs, and EVERY single name returned "no spread" while
+    SPY/QQQ/NVDA (deep OI on every expiry) traded normally. SBUX 38,042 vs 340; XLV 107,769
+    vs 617. Preferring the monthly targets that cause directly, where widening the DTE window
+    only raises the ODDS of catching one.
+
+    Ranking WITHIN each bucket is still nearest-the-midpoint, so this changes which expiry is
+    picked only when a monthly and a weekly both qualify -- it never rejects a tradeable
+    expiry, and with no monthly in range the behaviour is exactly as before.
+
+    NB indices are largely unaffected: SPY/QQQ quote deep OI on weeklies too, so the monthly
+    and the midpoint pick are usually the same or equally good.
 
     `before` (an earnings date, already buffered) restricts candidates to expiries that settle
     BEFORE it. Selecting the expiry is strictly better than opening a spread and closing it the
@@ -228,15 +256,22 @@ def pick_expiry(expiries: tuple[str, ...], today: pd.Timestamp,
     outcome: the name is simply not tradeable this cycle.
     """
     mid = (dte_min + dte_max) / 2
-    best = None
+    monthly, weekly = None, None
     for e in expiries:
         if before is not None and pd.Timestamp(e) >= before:
             continue
-        dte = (pd.Timestamp(e) - today).days
-        if dte_min <= dte <= dte_max:
-            if best is None or abs(dte - mid) < abs(best[1] - mid):
-                best = (e, dte)
-    return best
+        ts = pd.Timestamp(e)
+        dte = (ts - today).days
+        if not (dte_min <= dte <= dte_max):
+            continue
+        bucket = "monthly" if is_monthly(ts) else "weekly"
+        cur = monthly if bucket == "monthly" else weekly
+        if cur is None or abs(dte - mid) < abs(cur[1] - mid):
+            if bucket == "monthly":
+                monthly = (e, dte)
+            else:
+                weekly = (e, dte)
+    return monthly or weekly
 
 
 def correlated_pairs(prices: pd.DataFrame, threshold: float = 0.80,

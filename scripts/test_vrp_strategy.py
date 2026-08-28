@@ -214,6 +214,33 @@ for b in (0.0, -1_000.0, -1e9):
 print("\n--- EXPIRY + EARNINGS: the sentinel that was once backwards ---")
 TODAY = pd.Timestamp("2026-08-14")
 EXPS = tuple(str((TODAY + pd.Timedelta(days=d)).date()) for d in (7, 21, 31, 38, 45, 60))
+# ---- monthly-first expiry selection (2026-08-28) -------------------------------------
+# Single names carry usable OI only on 3rd-Friday monthlies; the weeklies between them are
+# near-dead, which is what made every single name return "no spread" on 2026-08-28.
+from options_vrp.strategy import is_monthly  # noqa: E402
+expect("is_monthly: 3rd Friday", Check(is_monthly(pd.Timestamp("2026-09-18")), "2026-09-18"))
+expect("is_monthly: 4th Friday is NOT", Check(not is_monthly(pd.Timestamp("2026-09-25")), "2026-09-25"))
+expect("is_monthly: 1st Friday is NOT", Check(not is_monthly(pd.Timestamp("2026-10-02")), "2026-10-02"))
+# A month starting ON a Friday must still resolve to the THIRD Friday, not the 15th.
+expect("is_monthly: month starting on a Friday",
+       Check(is_monthly(pd.Timestamp("2027-01-15")), "2027-01-15 (Jan 2027 starts Fri)"))
+
+_MIX = ("2026-09-18", "2026-09-25", "2026-10-02", "2026-10-09", "2026-10-16", "2026-10-23")
+_T = pd.Timestamp("2026-08-28")
+_pick = pick_expiry(_MIX, _T, 30, 50)
+expect("prefers the MONTHLY over a nearer-the-midpoint weekly",
+       Check(_pick == ("2026-10-16", 49), f"{_pick} (10-02 at 35d is nearer the 40 midpoint)"))
+_pick45 = pick_expiry(_MIX, _T, 30, 45)
+expect("no monthly in range -> falls back to the midpoint weekly (unchanged behaviour)",
+       Check(_pick45 == ("2026-10-02", 35), f"{_pick45}"))
+# The earnings filter must still dominate: a monthly settling AFTER the event is excluded
+# entirely, and selection then falls back to the nearest-midpoint WEEKLY among what is left.
+# (10-16 monthly is filtered out; 10-02 at 35d and 10-09 at 42d remain, midpoint is 40, so
+# 10-09 wins. Getting this wrong on the first attempt is exactly why the assertion is here.)
+_pick_ev = pick_expiry(_MIX, _T, 30, 50, before=pd.Timestamp("2026-10-10"))
+expect("earnings filter still outranks the monthly preference",
+       Check(_pick_ev == ("2026-10-09", 42), f"{_pick_ev}"))
+
 got = pick_expiry(EXPS, TODAY, CFG.dte_min, CFG.dte_max)
 expect("picks an expiry inside [dte_min, dte_max]",
        Check(got is not None and CFG.dte_min <= got[1] <= CFG.dte_max, f"{got}"))

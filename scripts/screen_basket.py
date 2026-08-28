@@ -53,7 +53,7 @@ sys.path.insert(0, str(ROOT))
 
 from options_vrp import data, signal  # noqa: E402
 from options_vrp.strategy import (DEFAULT_BASKET, OptionsConfig,  # noqa: E402
-                                  build_spread)
+                                  build_spread, pick_expiry)
 
 # Candidate pool. Deliberately includes non-equity underlyings: cost failure tracks price
 # level, strike-grid density and IV — not sector — so diversifying by sector (which fixed
@@ -129,12 +129,12 @@ def main() -> None:
         verdict = "no chain"
         try:
             tk, expiries = data.option_expiries(tk_name)
-            best = None
-            for e in expiries:
-                d = (pd.Timestamp(e) - today).days
-                if cfg.dte_min - 5 <= d <= cfg.dte_max + 5 and (
-                        best is None or abs(d - 37) < abs(best[1] - 37)):
-                    best = (e, d)
+            # Use the STRATEGY's own selector, not a local copy. An earlier version
+            # reimplemented it as "nearest 37 DTE within a widened window", which silently
+            # diverged from production the moment pick_expiry became monthly-first -- so the
+            # screen was measuring an expiry the live system would never trade. A diagnostic
+            # that reimplements the thing it is diagnosing stops being a diagnostic.
+            best = pick_expiry(tuple(expiries), today, cfg.dte_min, cfg.dte_max)
             if best:
                 puts = data.puts(tk, best[0])
                 iv = signal.atm_iv(puts, spot)
