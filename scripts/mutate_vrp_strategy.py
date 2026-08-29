@@ -63,9 +63,15 @@ MUTATIONS = [
     ("        if before is not None and pd.Timestamp(e) >= before:",
      "        if False:",
      "earnings filter disabled entirely"),
-    ("        if dte_min <= dte <= dte_max:",
-     "        if dte_min <= dte:",
+    # Pattern updated 2026-08-29: the monthly-first pick_expiry rewrite (e1d6796) inverted
+    # this into a guard clause, so the old form stopped matching and the fault silently could
+    # not be applied at all -- the mutation reported PATTERN MISSING rather than failing.
+    ("        if not (dte_min <= dte <= dte_max):",
+     "        if not (dte_min <= dte):",
      "expiry window upper bound removed"),
+    ("        bucket = \"monthly\" if is_monthly(ts) else \"weekly\"",
+     "        bucket = \"weekly\"",
+     "monthly preference disabled (falls back to thin weekly expiries)"),
 
     # --- MANAGEMENT ---
     ("    if current_value <= cfg.profit_target * entry_credit:",
