@@ -755,6 +755,15 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # close was booked as filled, so state dropped a spread that stayed open at IB with
         # nothing left to manage it. Each spread is two legs; compare per LEG, since a partial
         # fill can leave one leg on. Report only — never auto-correct a shared account.
+        #
+        # Let IB's portfolio feed catch up with THIS run's fills first. put_positions() reads
+        # ib.portfolio(), which lags a fill by a second or two, so reading it immediately after
+        # an open reports a just-filled spread as "broker 0" — a FALSE phantom in the email even
+        # though the order Filled and the position feed already shows the legs (IWM, 2026-09-08:
+        # opened 4x 278/271p @ -0.69, Filled, yet the reconcile the same second read broker 0).
+        # Same settle-delay magic-formula and trend-overlay already apply.
+        if not broker.dry_run and broker.ib is not None:
+            broker.ib.sleep(3)
         actual = broker.put_positions()
         if actual is not None:
             from options_vrp.broker import _ib_expiry
