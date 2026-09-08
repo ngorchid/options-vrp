@@ -64,6 +64,35 @@ def _stop_ab(state, stop_mult: float = 2.0) -> str:
             f"truncates the path and the counterfactual is unobservable.</i></p>")
 
 
+def _gate_ab(state) -> str:
+    """The gate A/B, readable from ONE book: with a name GATED, every spread the gate blocked
+    is shadowed and marked forward, so what it prevented is measurable. Mirror image of the
+    stop A/B above — there the rule was off and we recorded what it would have cut, here the
+    rule is on and we record what it did cut."""
+    try:
+        r = state.gate_counterfactual()
+    except Exception:  # noqa: BLE001 - reporting must never break the run
+        return ""
+    if not r.get("n_blocked"):
+        n_open = r.get("n_open_shadows", 0)
+        if not n_open:
+            return ""
+        return (f"<p style='font-size:13px;color:#475569'>Gate A/B: {n_open} blocked trade(s) "
+                f"being shadowed, none closed yet — no evidence either way.</p>")
+    net = r["blocked_pnl_net"]
+    verdict = ("the gate COST money by standing aside" if net > 0 else
+               "the gate SAVED money")
+    traded = (f"${r['traded_avg']:+,.0f} avg over {r['n_traded']} traded"
+              if r.get("traded_avg") is not None else "no traded comparison yet")
+    return (f"<p style='font-size:13px;color:#475569'>"
+            f"<b>Gate A/B</b> ({r['n_blocked']} blocked trades closed): they would have "
+            f"returned <b>${net:+,.0f}</b> net of execution "
+            f"({r['blocked_win_rate']:.0%} winners, ${r['blocked_avg']:+,.0f} each) "
+            f"against {traded} &rarr; <b>{verdict}</b>. "
+            f"<i>Blocked trades are marked to the combo mid and never actually filled, so any "
+            f"residual bias flatters them — i.e. it tilts toward 'the gate was costly'.</i></p>")
+
+
 def _close_tally(trade_log) -> str:
     """Lifetime count of WHY spreads were closed — the stop-vs-no-stop A/B at a glance."""
     reasons = [t.get("reason") for t in trade_log if t.get("action") == "CLOSE"]
@@ -90,6 +119,7 @@ def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=F
        since {state.inception_date}</p>
     <p>Closes since inception (why) — <b>{_close_tally(state.trade_log)}</b></p>
     {_stop_ab(state)}
+    {_gate_ab(state)}
     <h3>Open spreads</h3><table border=1 cellpadding=4>
     <tr><th>ticker</th><th>expiry</th><th>spread</th><th>credit</th><th>mark</th><th>unreal P&L</th></tr>
     {_rows(state.open_spreads, values)}</table>

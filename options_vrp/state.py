@@ -33,11 +33,50 @@ class OpenSpread:
 
 
 @dataclass
+class ShadowSpread:
+    """A spread the REGIME GATE blocked. Never sent to the broker.
+
+    A gated name only ever shows the trades it TOOK, so on its own it can never answer whether
+    the gate helped: a gate that blocked five losers and a gate that blocked five winners leave
+    the identical visible record. This records what was blocked and marks it forward, exactly as
+    `peak_value` on OpenSpread does for the 2x stop — one book, both arms.
+
+    Marked from the SAME source as the real book (`broker.quote_spread`, the combo bid/ask), so
+    the two arms are comparable rather than one being priced off a different feed. `cost_ratio`
+    is the round-trip cost as a fraction of credit AT ENTRY, so the reporter can show shadow P&L
+    both gross and net of what execution would have taken.
+    """
+    ticker: str
+    expiry: str
+    short_strike: float
+    long_strike: float
+    contracts: int
+    entry_credit: float      # per share
+    max_loss: float          # per share
+    entry_date: str
+    entry_spot: float
+    gate_ratio: float        # VIX/VIX3M when it was blocked
+    gate_thr: float          # the threshold that blocked it
+    vrp: float               # the VRP the trade was blocked at
+    cost_ratio: float | None = None   # round-trip cost / credit at entry, None if unquotable
+    peak_value: float = 0.0
+
+    @property
+    def key(self) -> str:
+        return f"{self.ticker}_{self.expiry}_{self.short_strike:g}_{self.long_strike:g}"
+
+
+@dataclass
 class OptionsState:
     inception_date: str | None = None
     realized_pnl: float = 0.0
     open_spreads: list = field(default_factory=list)   # list[OpenSpread]
     trade_log: list = field(default_factory=list)
+    # The gate counterfactual. Kept separate from the real book so no shadow can ever be
+    # mistaken for a position: nothing here is sent to the broker, and shadow P&L never touches
+    # realized_pnl or nav_history.
+    shadow_spreads: list = field(default_factory=list)  # list[ShadowSpread]
+    shadow_log: list = field(default_factory=list)
     nav_history: list = field(default_factory=list)    # [(date, total_pnl)]
     # Account-wide NetLiquidation as of the LAST run. The budget is a fraction of it, but the
     # config is built before the broker connects, so it is read from here and refreshed after.
@@ -59,6 +98,7 @@ class OptionsState:
             return cls()
         d = json.loads(Path(path).read_text())
         d["open_spreads"] = [OpenSpread(**s) for s in d.get("open_spreads", [])]
+        d["shadow_spreads"] = [ShadowSpread(**s) for s in d.get("shadow_spreads", [])]
         return cls(**d)
 
     def save(self, path: Path) -> None:
@@ -119,6 +159,67 @@ class OptionsState:
             "stop_would_have_booked": stopped_pnl,
             "edge_of_no_stop": sum(t["pnl"] for t in hit) - stopped_pnl,
             "pnl_untouched_group": sum(t["pnl"] for t in miss),
+        }
+
+    # --- gate counterfactual ---
+    def has_shadow(self, key: str) -> bool:
+        return any(s.key == key for s in self.shadow_spreads)
+
+    def record_shadow_open(self, sh: "ShadowSpread") -> None:
+        self.shadow_spreads.append(sh)
+        self.shadow_log.append({"date": sh.entry_date, "action": "SHADOW_OPEN", "key": sh.key,
+                                "ticker": sh.ticker, "contracts": sh.contracts,
+                                "credit": sh.entry_credit, "vrp": sh.vrp,
+                                "gate_ratio": sh.gate_ratio, "cost_ratio": sh.cost_ratio})
+
+    def record_shadow_close(self, sh: "ShadowSpread", close_value: float, today: str,
+                            reason: str) -> float:
+        """close_value = per-share debit to close. Books NOTHING real — logs only."""
+        gross = (sh.entry_credit - close_value) * 100 * sh.contracts
+        # cost_ratio is the FULL round-trip cost as a fraction of the credit, so charging it
+        # against the total credit received gives the dollars execution would have taken.
+        cost = (sh.cost_ratio or 0.0) * sh.entry_credit * 100 * sh.contracts
+        self.shadow_spreads = [s for s in self.shadow_spreads if s.key != sh.key]
+        self.shadow_log.append({"date": today, "action": "SHADOW_CLOSE", "key": sh.key,
+                                "ticker": sh.ticker, "close_value": close_value,
+                                "pnl_gross": gross, "pnl_net": gross - cost,
+                                "reason": reason, "entry_credit": sh.entry_credit,
+                                "contracts": sh.contracts, "vrp": sh.vrp,
+                                "gate_ratio": sh.gate_ratio})
+        return gross - cost
+
+    def gate_counterfactual(self, ticker: str | None = None) -> dict:
+        """Did the gate earn its keep? Compares blocked trades against the ones it allowed.
+
+        `blocked_*` is what the gate PREVENTED. If that total is NEGATIVE the gate paid for
+        itself; if it is positive and comparable to the traded arm, the gate is dead weight.
+
+        Read with care: the blocked arm is a mark-to-market simulation with no fills, so it
+        never suffers slippage or a rejected order. `pnl_net` charges the measured round-trip
+        cost to compensate, but any residual bias FLATTERS the blocked arm, i.e. it tilts
+        toward concluding the gate was costly.
+        """
+        closed = [t for t in self.shadow_log if t.get("action") == "SHADOW_CLOSE"]
+        traded = [t for t in self.trade_log if t.get("action") == "CLOSE"]
+        if ticker:
+            closed = [t for t in closed if t.get("ticker") == ticker]
+            traded = [t for t in traded if str(t.get("key", "")).startswith(f"{ticker}_")]
+        if not closed:
+            return {"n_blocked": 0, "n_open_shadows": len(self.shadow_spreads)}
+        gross = sum(t["pnl_gross"] for t in closed)
+        net = sum(t["pnl_net"] for t in closed)
+        return {
+            "n_blocked": len(closed),
+            "n_open_shadows": len(self.shadow_spreads),
+            "blocked_pnl_gross": gross,
+            "blocked_pnl_net": net,
+            "blocked_win_rate": sum(1 for t in closed if t["pnl_net"] > 0) / len(closed),
+            "blocked_avg": net / len(closed),
+            "n_traded": len(traded),
+            "traded_pnl": sum(t["pnl"] for t in traded),
+            "traded_avg": (sum(t["pnl"] for t in traded) / len(traded)) if traded else None,
+            # The headline: positive means the gate cost money by standing aside.
+            "gate_cost": net,
         }
 
     def record_snapshot(self, today: str, total_pnl: float) -> None:

@@ -501,6 +501,9 @@ class BookResult:
     # panel. Empty when there is too little history, in which case the caller falls back to the
     # static OVERLAP map rather than dropping the check.
     corr_overlap: dict = field(default_factory=dict)
+    # Spreads a PER-NAME gate blocked that would otherwise have been opened. Not orders: the
+    # caller shadows these so the gate's cost is measurable. Empty when no name is gated.
+    blocked: list = field(default_factory=list)      # list[SpreadTarget]
 
 
 def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookResult:
@@ -535,6 +538,7 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
 
     diags: list[dict] = []
     candidates: list[SpreadTarget] = []
+    blocked: list[SpreadTarget] = []
     bad_chains: list[str] = []
     checked_chains = 0
     for tk_name in cfg.basket:
@@ -593,11 +597,16 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
             elif name_open:
                 rec["note"] = f"VRP {signal.vrp(iv, rv):+.1%} ≤ min"
             else:
-                # Logged rather than silently skipped: a gated name only ever shows the trades
-                # it TOOK, so without this line the gate's cost is unobservable. This records
-                # that a trade was blocked and the VRP it was blocked at.
+                # A gated name only ever shows the trades it TOOK, so without this the gate's
+                # cost is unobservable. BUILD the spread anyway and hand it back as `blocked`:
+                # the caller shadows it, marks it forward and reports what the gate prevented.
                 rec["note"] = (f"GATE SHUT for {tk_name} (VIX/VIX3M {ratio:.2f} ≥ "
                                f"{name_thr:.2f}), VRP was {signal.vrp(iv, rv):+.1%}")
+                if signal.vrp(iv, rv) > cfg.vrp_min:
+                    bsp = build_spread(tk_name, pdf, spot, expiry, dte, iv, rv, cfg)
+                    if bsp and bsp.contracts > 0:
+                        blocked.append(bsp)
+                        rec["note"] += " — shadowed"
         except Exception as e:  # noqa: BLE001
             rec["note"] = f"chain error: {type(e).__name__}"
         diags.append(rec)
@@ -615,7 +624,7 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
 
     candidates.sort(key=lambda s: s.vrp, reverse=True)
     return BookResult(ratio, vix, open_, diags, candidates[: cfg.max_positions],
-                      correlated_pairs(prices, cfg.corr_overlap_thr))
+                      correlated_pairs(prices, cfg.corr_overlap_thr), blocked)
 
 
 def cost_ok(bid: float | None, ask: float | None, max_frac: float,

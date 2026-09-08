@@ -29,7 +29,7 @@ from options_vrp.strategy import OVERLAP, SECTOR  # noqa: E402
 from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
-from options_vrp.state import OpenSpread, OptionsState  # noqa: E402
+from options_vrp.state import OpenSpread, OptionsState, ShadowSpread  # noqa: E402
 from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
                         code_version,
                         check_allocations, check_order,
@@ -192,6 +192,18 @@ def dry_run(cfg: OptionsConfig) -> None:
         print(f"  {s.ticker:6s} {s.expiry} ({s.dte}d)  SELL {s.contracts}x {s.short_strike:g}/{s.long_strike:g}p  "
               f"Δ{abs(s.short_delta):.2f}/{abs(s.long_delta):.2f}  credit ${s.credit*100:,.0f}  "
               f"maxloss ${s.max_loss*100:,.0f}  VRP {s.vrp:+.1%}  risk ${s.max_loss*100*s.contracts:,.0f}")
+    _blocked_table(res)
+
+
+def _blocked_table(res) -> None:
+    """Trades a per-name gate blocked. Shadowed live so the gate's cost is measurable."""
+    if not res.blocked:
+        return
+    print("\nBLOCKED BY GATE (shadowed, never traded — measures what the gate costs)")
+    for s in res.blocked:
+        print(f"  {s.ticker:6s} {s.expiry} ({s.dte}d)  would SELL {s.contracts}x "
+              f"{s.short_strike:g}/{s.long_strike:g}p  credit ${s.credit*100:,.0f}  "
+              f"VRP {s.vrp:+.1%}")
 
 
 def selftest(cfg: OptionsConfig) -> None:
@@ -322,6 +334,36 @@ def selftest(cfg: OptionsConfig) -> None:
         got = pick_expiry(exps, tday, cfg.dte_min, cfg.dte_max, before=cut)
         print(f"  {tk:8s} {lbl:29s} -> "
               f"{f'{got[0]} ({got[1]}d)' if got else 'SKIP'}   {note}")
+
+    # GATE COUNTERFACTUAL. The live path needs IB, so this exercises the bookkeeping offline:
+    # a gated name blocks trades, they are shadowed, and the reporter must say whether the gate
+    # cost or saved money. Two blocked trades, one winner and one loser, net negative overall =>
+    # the gate SAVED money and must be reported as such.
+    print("\nSELF-TEST — gate counterfactual (shadow book, no IB):")
+    st = OptionsState()
+    a = ShadowSpread("USO", "2026-10-16", 128, 123, 3, entry_credit=0.72, max_loss=4.28,
+                     entry_date="2026-09-10", entry_spot=146.0, gate_ratio=1.04,
+                     gate_thr=1.00, vrp=0.107, cost_ratio=0.10)
+    b = ShadowSpread("USO", "2026-11-20", 120, 115, 3, entry_credit=0.60, max_loss=4.40,
+                     entry_date="2026-10-20", entry_spot=138.0, gate_ratio=1.02,
+                     gate_thr=1.00, vrp=0.084, cost_ratio=0.10)
+    st.record_shadow_open(a); st.record_shadow_open(b)
+    print(f"  opened {len(st.shadow_spreads)} shadows; reporter with none closed -> "
+          f"{st.gate_counterfactual()['n_blocked']} closed, "
+          f"{st.gate_counterfactual()['n_open_shadows']} open")
+    p1 = st.record_shadow_close(a, 0.36, "2026-09-24", "profit")   # closed at 50% => winner
+    p2 = st.record_shadow_close(b, 2.40, "2026-11-05", "time")     # ran against it => loser
+    r = st.gate_counterfactual()
+    print(f"  shadow 1 (profit take) -> ${p1:+,.0f} net")
+    print(f"  shadow 2 (time stop)   -> ${p2:+,.0f} net")
+    print(f"  blocked total ${r['blocked_pnl_net']:+,.0f} net "
+          f"({r['blocked_win_rate']:.0%} winners, {r['n_blocked']} trades)")
+    print(f"  VERDICT: gate {'COST' if r['gate_cost'] > 0 else 'SAVED'} money "
+          f"-> {'remove it' if r['gate_cost'] > 0 else 'keep it'}")
+    assert r["n_blocked"] == 2 and st.shadow_spreads == [], "shadow bookkeeping broken"
+    assert st.realized_pnl == 0.0, "shadow P&L must NEVER touch the real ledger"
+    print("  real ledger untouched by shadows: realized_pnl "
+          f"${st.realized_pnl:,.0f} (must be $0)")
 
 
 def _resolve_pending(broker, state, today: str) -> None:
@@ -638,6 +680,70 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                         # confirms it actually filled at IB, and reverses the booking if it did not.
                         state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),
                                                      "spread": asdict(sp), "placed_date": today})
+
+        # 2b) GATE COUNTERFACTUAL — shadow the trades the gate blocked.
+        #
+        # Nothing here reaches the broker. A gated name only shows the trades it TOOK, so
+        # without this the gate can never be judged: blocking five losers and blocking five
+        # winners leave the same visible record. Same one-book-both-arms idea as `peak_value`
+        # for the 2x stop, run in the opposite direction (there the stop was OFF and we
+        # recorded what it WOULD have cut; here the gate is ON and we record what it DID cut).
+        #
+        # Marked via broker.quote_spread — the same combo bid/ask the real book is priced and
+        # cost-screened on — so the two arms are comparable. quote_spread needs an IB market
+        # data subscription and returns (None, None) without one; a shadow that cannot be
+        # quoted is simply left unmarked that day, exactly as a real spread is.
+        def _shadow_mark(sh) -> float | None:
+            probe = OpenSpread(sh.ticker, sh.expiry, sh.short_strike, sh.long_strike,
+                               sh.contracts, sh.entry_credit, sh.max_loss, sh.entry_date,
+                               sh.entry_spot)
+            b, a = broker.quote_spread(probe)
+            if b is None or a is None:
+                return None
+            return (abs(float(b)) + abs(float(a))) / 2.0
+
+        for sh in list(state.shadow_spreads):
+            cv = _shadow_mark(sh)
+            if cv is None:
+                continue
+            sh.peak_value = max(getattr(sh, "peak_value", 0.0) or 0.0, cv)
+            sdte = (pd.Timestamp(sh.expiry) - pd.Timestamp(today)).days
+            saction = manage_action(sh.entry_credit, cv, sdte, cfg)
+            if saction:
+                pnl = state.record_shadow_close(sh, cv, today, saction)
+                logging.info("SHADOW CLOSE %s (%s) — blocked trade would have made $%.0f net",
+                             sh.key, saction, pnl)
+
+        for s in res.blocked:
+            probe = _spread_of(s)
+            if state.has_shadow(probe.key) or any(x.ticker == s.ticker
+                                                  for x in state.shadow_spreads):
+                continue          # one shadow per ticker, mirroring the real book's rule
+            b, a = broker.quote_spread(probe)
+            _ok, _ratio, _br = cost_ok(b, a, cfg.max_cost_frac,
+                                       cfg.commission_per_contract, cfg.option_multiplier)
+            # The cost guard is NOT applied as a veto here: a shadow that the guard would have
+            # rejected is still informative, and recording its cost_ratio lets the reporter
+            # charge execution rather than silently assume it away.
+            credit = ((abs(float(b)) + abs(float(a))) / 2.0) if (b is not None and a is not None) \
+                else s.credit
+            sh = ShadowSpread(s.ticker, s.expiry, s.short_strike, s.long_strike, s.contracts,
+                              credit, s.max_loss, today, s.spot,
+                              gate_ratio=res.regime_ratio, gate_thr=cfg.thr_for(s.ticker),
+                              vrp=s.vrp, cost_ratio=_ratio)
+            state.record_shadow_open(sh)
+            logging.info("SHADOW OPEN %s — gate blocked it at VIX/VIX3M %.3f, VRP %+.1f%%, "
+                         "credit $%.0f/ct%s", sh.key, res.regime_ratio, 100 * s.vrp,
+                         credit * 100, "" if _ratio is None else f", cost {_ratio:.0%}")
+
+        _gc = state.gate_counterfactual()
+        if _gc.get("n_blocked"):
+            logging.info("GATE COUNTERFACTUAL: %d blocked trades closed, net $%.0f "
+                         "(%.0f%% winners) vs %d traded at $%.0f avg — %s",
+                         _gc["n_blocked"], _gc["blocked_pnl_net"],
+                         100 * _gc["blocked_win_rate"], _gc["n_traded"],
+                         _gc["traded_avg"] or 0.0,
+                         "gate COST money" if _gc["gate_cost"] > 0 else "gate SAVED money")
 
         # 3) mark, persist, email
         values = broker.spread_values(state.open_spreads)
