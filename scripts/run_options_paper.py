@@ -230,7 +230,9 @@ def selftest(cfg: OptionsConfig) -> None:
         if pick is None:
             print(f"  {label:26s} -> no eligible strike (no trade)")
             continue
-        K, d, mid = pick
+        # 4-tuple since e7b5fd1 added the leg's bid/ask width; the selftest still unpacked 3,
+        # which made --selftest raise before reaching the leg-collision case below.
+        K, d, mid, _width = pick
         oi = int(chain.loc[chain["strike"] == K, "openInterest"].iloc[0])
         row = chain.loc[chain["strike"] == K].iloc[0]
         ok, ratio, _ = cost_ok(row["bid"], row["ask"], cfg.max_cost_frac,
