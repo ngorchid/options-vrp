@@ -36,6 +36,7 @@ except ImportError:  # guard unavailable -> keep trading, just unscreened
 # wrongly halt the index sleeve. Any ticker NOT listed here is treated as an earnings name.
 NO_EARNINGS_TICKERS = frozenset({
     "SPY", "QQQ", "IWM", "XLV", "XLE", "TLT", "GLD", "SLV", "HYG", "LQD", "EEM", "EFA",
+    "USO", "USL", "UNG", "GDX",   # commodity ETFs — added with USO on 2026-09-08
     "XLF", "XLP", "XLY", "XLI", "XLK", "XLU", "XLB", "XLC", "XLRE", "DIA", "VTI", "IVV",
     "SPX", "XSP", "VIX",
 })
@@ -90,6 +91,38 @@ DEFAULT_BASKET = [
     "DE", "CAT",                  # industrials
     "NKE",                        # consumer (added 2026-08-28)
     "BAC",                        # financials (added 2026-08-28) — the basket had NO financials
+    "GLD",                        # gold — UNGATED (added 2026-09-08)
+    "USO",                        # crude — GATED, see REGIME_THR_BY_NAME (added 2026-09-08)
+    # GLD and USO added 2026-09-08 to move part of the sleeve OFF the equity risk factor, which
+    # is the book's real concentration: the magic-formula core is beta ~1 and this sleeve is
+    # short equity tail risk. Measured on free vol-index data 2008-2026
+    # (algo_trading/scripts/cross_asset_vrp_lab.py), VRP = implied minus next-21d realised:
+    #
+    #   market            mean VRP   % positive   Newey-West t   in equity's worst 21 months
+    #   equity (VIX/SPY)  +3.59 pts     83%           6.93            -11.32  (0% positive)
+    #   gold   (GVZ/GLD)  +2.65 pts     79%           7.65             -0.07  (62% positive)
+    #   oil    (OVX/USO)  +5.80 pts     79%           7.63             -7.70  (24% positive)
+    #   rates  (MOVE/10y) +0.53 bp      55%           0.38            -12.63  (38% positive)
+    #
+    # GLD is the clean add: a real premium AND essentially flat in the months the equity sleeve
+    # bleeds. Its max daily-return correlation to this basket is 0.21 (vs IWM), the lowest of any
+    # member. It cleared the 2026-08-10 market-hours cost screen at 8.4% of credit, and at ~$400
+    # spot on a $1 grid there are ~10 strikes between the 16d and 10d legs — the opposite of the
+    # TLT failure below. It holds bullion, so unlike USO there is no roll decay.
+    #
+    # USO is the EXPERIMENT, and is gated for a specific measured reason. Oil has the largest
+    # premium of the four but the worst tail, and its VRP correlates +0.65 with equity's, rising
+    # to +0.72 in the tail — so on its own it is a levered bet on the SAME factor, not a
+    # diversifier. What makes it worth running gated: of the 30 worst oil outcomes only 43% were
+    # entered with VIX/VIX3M below 1.00, against 100% for gold and 53% for equity. That asymmetry
+    # is consistent with equity vol term structure LEADING oil vol blowups (2008, 2015, 2020)
+    # while being merely COINCIDENT for equities — which is exactly why the gate failed on SPX.
+    # UNVALIDATED: it rests on a capped-VRP proxy that gets the sign WRONG on SPX when checked
+    # against the real OPRA option P&L, so this is a forward test, not a backed conclusion.
+    # NB USO's roll decay inflates its realised vol, biasing its measured VRP DOWN — conservative.
+    # NB USO correlates 0.62 with XOM and XLE: below the 0.80 overlap block and not in SECTOR,
+    # so nothing stops the book holding all three energy-complex names at once. Left deliberately,
+    # since crude is a different exposure from energy equities, but it is worth watching.
     # NKE and BAC added from the 2026-08-28 market-hours screen, which was the first one to
     # measure COST alongside VRP. Both cleared all three filters on that snapshot: NKE VRP
     # +10.7% / corr +0.27 / cost 23%, BAC VRP +6.2% / corr +0.37 / cost 18% (corr measured
@@ -117,6 +150,16 @@ DEFAULT_BASKET = [
 class OptionsConfig:
     basket: list[str] = field(default_factory=lambda: list(DEFAULT_BASKET))
     regime_thr: float = 1.00          # sell only when VIX/VIX3M < this (contango)
+    # PER-NAME gate override, ticker -> threshold. Absent names use `regime_thr`.
+    # The gate used to be one global switch that emptied the whole book; it was turned OFF for
+    # everything on 2026-08-28 (REGIME_THR 1.00 -> 99) because the OPRA backtest measured it as
+    # a cost, not a protection: gate OFF +0.85 Sharpe vs ON +0.62 at the corrected 6% cost, with
+    # no drawdown benefit either way (-5,244 both), and 7 of the 8 largest losses were entered
+    # with it wide open. That verdict is EQUITY-specific — the gate is a coincident stress
+    # detector there. Oil may differ (see the USO note in DEFAULT_BASKET), so the switch is now
+    # per-name rather than all-or-nothing, which is the only way to run one name gated and the
+    # rest not. Set via REGIME_THR_BY_NAME, e.g. "USO:1.00".
+    regime_thr_by_name: dict[str, float] = field(default_factory=dict)
     vrp_min: float = 0.02             # require ATM IV − RV20 above this (vol points): skip thin premium
     short_delta: float = 0.16         # short put ≈ 1σ
     long_delta: float = 0.10          # long put (defined-risk wing); nearer = narrower spread
@@ -202,6 +245,14 @@ class OptionsConfig:
     # NO_EARNINGS_TICKERS so a provider outage cannot silently halt the index sleeve.
     skip_if_earnings_unknown: bool = True
     time_stop_dte: int = 21           # close on/under this DTE regardless
+
+    def thr_for(self, ticker: str) -> float:
+        """Regime threshold for one name: its override, else the global default."""
+        return self.regime_thr_by_name.get(ticker, self.regime_thr)
+
+    def gated_names(self) -> list[str]:
+        """Names whose gate can actually shut (threshold below the 99 = off sentinel)."""
+        return sorted(t for t in self.basket if self.thr_for(t) < 99)
 
 
 @dataclass
@@ -525,7 +576,13 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
                     bad_chains.append(tk_name)
                     diags.append(rec)
                     continue
-            if open_ and signal.vrp(iv, rv) > cfg.vrp_min:
+            # PER-NAME gate. `open_` above is the global state kept for reporting; the decision
+            # is taken per ticker so one name can be gated while the rest are not.
+            name_thr = cfg.thr_for(tk_name)
+            name_open = signal.regime_open(ratio, name_thr)
+            rec["gate_thr"] = name_thr
+            rec["gate_open"] = name_open
+            if name_open and signal.vrp(iv, rv) > cfg.vrp_min:
                 sp = build_spread(tk_name, pdf, spot, expiry, dte, iv, rv, cfg)
                 if sp and sp.contracts > 0:
                     candidates.append(sp)
@@ -533,8 +590,14 @@ def target_book(cfg: OptionsConfig, today: pd.Timestamp | None = None) -> BookRe
                     rec["note"] = "sized to 0 (max-loss > risk budget)"
                 else:
                     rec["note"] = "no valid spread (strikes/credit)"
-            elif open_:
+            elif name_open:
                 rec["note"] = f"VRP {signal.vrp(iv, rv):+.1%} ≤ min"
+            else:
+                # Logged rather than silently skipped: a gated name only ever shows the trades
+                # it TOOK, so without this line the gate's cost is unobservable. This records
+                # that a trade was blocked and the VRP it was blocked at.
+                rec["note"] = (f"GATE SHUT for {tk_name} (VIX/VIX3M {ratio:.2f} ≥ "
+                               f"{name_thr:.2f}), VRP was {signal.vrp(iv, rv):+.1%}")
         except Exception as e:  # noqa: BLE001
             rec["note"] = f"chain error: {type(e).__name__}"
         diags.append(rec)

@@ -99,6 +99,27 @@ BREAKER_SIGMAS = (2.0, 2.6, 3.2)      # -> 12.5% / 16.3% / 20.0% at VOL_PRIOR
 # `BUDGET` in .env still overrides for a deliberate one-off, and says so in the log.
 
 
+def _parse_gated(spec: str) -> dict[str, float]:
+    """Parse "USO:1.00,CAT:0.95" into {"USO": 1.00, "CAT": 0.95}.
+
+    A malformed entry is dropped with a warning rather than raising: a typo in an env var must
+    not stop the whole book from running, and the effect of dropping it is that the name falls
+    back to the global threshold (gate off), which is the safe direction — it trades as usual
+    instead of silently never trading.
+    """
+    out: dict[str, float] = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        ticker, _, thr = part.partition(":")
+        try:
+            out[ticker.strip().upper()] = float(thr)
+        except ValueError:
+            logging.warning("REGIME_THR_BY_NAME: ignoring malformed entry %r", part)
+    return out
+
+
 def _cfg(state: OptionsState | None = None) -> OptionsConfig:
     """BUDGET is the BASE capital; sizing compounds off this strategy's OWN realised P&L.
 
@@ -132,6 +153,7 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
     return OptionsConfig(
         budget=budget,
         regime_thr=float(os.getenv("REGIME_THR", "99")),   # 99 = gate off; see .env.example
+        regime_thr_by_name=_parse_gated(os.getenv("REGIME_THR_BY_NAME", "USO:1.00")),
         vrp_min=float(os.getenv("VRP_MIN", "0.02")),
         stop_mult=float(os.getenv("STOP_MULT", "0")),
         max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),
@@ -147,7 +169,13 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
 def dry_run(cfg: OptionsConfig) -> None:
     res = target_book(cfg)
     gate = "OPEN (contango)" if res.regime_open else "SHUT (backwardation)"
-    print(f"\nREGIME  VIX/VIX3M = {res.regime_ratio:.3f}  (thr {cfg.regime_thr:.2f})  VIX {res.vix:.1f}  ->  gate {gate}")
+    _global = "OFF (thr>=99)" if cfg.regime_thr >= 99 else gate
+    print(f"\nREGIME  VIX/VIX3M = {res.regime_ratio:.3f}  (thr {cfg.regime_thr:.2f})  "
+          f"VIX {res.vix:.1f}  ->  global gate {_global}")
+    for tk in cfg.gated_names():
+        thr = cfg.thr_for(tk)
+        state_ = "OPEN" if res.regime_ratio < thr else "SHUT — no new premium sold"
+        print(f"        per-name gate: {tk} thr {thr:.2f} -> {state_}")
     print(f"\n{'ticker':7s} {'spot':>9s} {'RV':>7s} {'IV':>7s} {'VRP':>7s} {'expiry':>11s} {'dte':>4s}  note")
     print("-" * 70)
     for d in res.diagnostics:
