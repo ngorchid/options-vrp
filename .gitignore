@@ -1,4 +1,10 @@
 .env
 __pycache__/
 *.pyc
-results/
+# results/ holds runtime data (state.json, quotes.csv, panels, run.log) — all ignored — EXCEPT
+# the deployment tracker's CSV, which is research data we deliberately collect to preserve and
+# share. `results/*` (not `results/`) lets us re-include one path beneath an otherwise-ignored dir.
+results/*
+!results/paper/
+results/paper/*
+!results/paper/deployment_log.csv
