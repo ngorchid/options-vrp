@@ -27,6 +27,10 @@ class OptionsBroker:
     def __init__(self, host="127.0.0.1", port=7497, client_id=7, dry_run=False):
         self.host, self.port, self.client_id, self.dry_run = host, port, client_id, dry_run
         self.ib = None
+        # Stamped on every order as IB's orderRef ("<strategy>:<run id>"), set by the runner.
+        # The account is shared by several sleeves; IB carries orderRef into executions and Flex
+        # statements, so every fill is attributable to a strategy AND the run that placed it.
+        self.order_ref: str | None = None
 
     def connect(self, timeout: int = 15) -> bool:
         from ib_insync import IB
@@ -113,6 +117,8 @@ class OptionsBroker:
         bag = self._bag(sp.ticker, short_leg, long_leg)
         order = MarketOrder(action, sp.contracts)
         order.tif = "DAY"
+        if getattr(self, "order_ref", None):            # a missing tag must never stop an order
+            order.orderRef = self.order_ref
         trade = self.ib.placeOrder(bag, order)
         # Poll up to `wait` seconds, returning as soon as the order reaches a terminal state.
         # A single fixed sleep too often read the status while still PreSubmitted, so the email

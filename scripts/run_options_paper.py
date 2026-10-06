@@ -47,6 +47,11 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
 
+# One id per run, stamped on every order as orderRef "options-vrp:<RUN_ID>" — so each fill in
+# IB's executions and Flex statements traces back to this sleeve AND to this run's log section.
+RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S")
+ORDER_REF = f"options-vrp:{RUN_ID}"
+
 # Annualised vol prior for the circuit-breaker levels, from the SPX VRP backtest marked daily
 # (algo_trading/scripts/breaker_calibration_lab.py, live spec): 6.3%.
 #
@@ -433,6 +438,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
     broker = OptionsBroker(port=port, client_id=client_id, dry_run=False)
+    broker.order_ref = ORDER_REF
+    logging.info("run id %s — orders tagged orderRef=%s", RUN_ID, ORDER_REF)
     if not broker.connect():
         logging.error("IB connect failed — aborting."); return
     state = OptionsState.load(STATE_FILE); state.ensure_inception(today)
