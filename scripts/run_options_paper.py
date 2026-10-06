@@ -52,6 +52,57 @@ STATE_FILE = ROOT / "results" / "paper" / "state.json"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S")
 ORDER_REF = f"options-vrp:{RUN_ID}"
 
+
+def make_broker(**kw):
+    """The run's broker, tagged with this run's ORDER_REF. A factory rather than two inline lines
+    so the tagging is testable: scripts/test_order_links.py asserts run_live builds its broker
+    here and that the tag is set, because a runner that forgets it sends every order out untagged
+    while the broker-level tests stay green."""
+    from options_vrp.broker import OptionsBroker
+    b = OptionsBroker(**kw)
+    b.order_ref = ORDER_REF
+    return b
+
+
+def book_open(state, sp, fill: dict, fallback_credit: float, today: str) -> bool:
+    """Book an OPEN into the ledger with its link to IB's records. True if booked.
+
+    Booked on Filled AND on a live non-terminal status (Submitted/PreSubmitted): the latter is
+    optimistic, so it is also tracked in pending_orders and the next run confirms it actually
+    filled at IB, reversing the booking if it did not."""
+    if fill["status"] not in ("Filled", "Submitted", "PreSubmitted"):
+        return False
+    credit = fill["net_price"] if fill["net_price"] is not None else fallback_credit
+    state.record_open(sp, credit, today, order_ref=fill.get("order_ref", ""),
+                      exec_ids=fill.get("exec_ids"))
+    if fill["status"] != "Filled":
+        state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),
+                                     "spread": asdict(sp), "placed_date": today,
+                                     "order_ref": fill.get("order_ref", "")})
+    return True
+
+
+def book_close(state, sp, fill: dict, action: str, today: str) -> dict:
+    """Book a CLOSE into the ledger with its link to IB's records; returns the email's order row.
+
+    Only BOOK the close when it actually FILLED. A DAY order left at PreSubmitted/PendingSubmit
+    (e.g. submitted near the close) may never fill; recording it would drop the spread from state
+    while it stays open at IB -- the phantom-close bug (a pending SBUX close was booked as realized
+    profit on 2026-08-07, then never filled). An unfilled close is left open and tracked in
+    pending_orders: if the capped combo fills after this poll, the next run books it from the real
+    IB fill instead of leaving a phantom (the 2026-08-21 SBUX case)."""
+    if fill["status"] == "Filled" and fill["net_price"] is not None:
+        pnl = state.record_close(sp, fill["net_price"], today, action,
+                                 order_ref=fill.get("order_ref", ""),
+                                 exec_ids=fill.get("exec_ids"))
+        return {**fill, "pnl": pnl, "reason": action}
+    logging.warning("close for %s NOT filled (status=%s) — left open, pending self-heal",
+                    sp.key, fill["status"])
+    state.pending_orders.append({"action": "close", "permId": fill.get("permId", 0),
+                                 "spread": asdict(sp), "placed_date": today,
+                                 "order_ref": fill.get("order_ref", "")})
+    return {**fill, "pnl": None, "reason": f"{action} (unfilled)"}
+
 # Annualised vol prior for the circuit-breaker levels, from the SPX VRP backtest marked daily
 # (algo_trading/scripts/breaker_calibration_lab.py, live spec): 6.3%.
 #
@@ -433,13 +484,11 @@ def _resolve_pending(broker, state, today: str) -> None:
 
 # ---------- live ----------
 def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
-    from options_vrp.broker import OptionsBroker
     from options_vrp.email_report import send_report
 
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
-    broker = OptionsBroker(port=port, client_id=client_id, dry_run=False)
-    broker.order_ref = ORDER_REF
+    broker = make_broker(port=port, client_id=client_id, dry_run=False)
     logging.info("run id %s — orders tagged orderRef=%s", RUN_ID, ORDER_REF)
     if not broker.connect():
         logging.error("IB connect failed — aborting."); return
@@ -486,26 +535,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             action = manage_action(sp.entry_credit, cv, dte, cfg)
             if action:
                 fill = broker.close_spread(sp)
-                # Only BOOK the close when it actually FILLED. A DAY order left at
-                # PreSubmitted/PendingSubmit (e.g. submitted near the close) may never fill;
-                # recording it would drop the spread from state while it stays open at IB —
-                # the phantom-close bug (a pending SBUX close was booked as realized profit
-                # on 2026-08-07, then never filled). Leave an unfilled close open so it is
-                # retried / reconciled next run rather than booked off the mark.
-                if fill["status"] == "Filled" and fill["net_price"] is not None:
-                    pnl = state.record_close(sp, fill["net_price"], today, action,
-                                             order_ref=fill.get("order_ref", ""),
-                                             exec_ids=fill.get("exec_ids"))
-                    orders.append({**fill, "pnl": pnl, "reason": action})
-                else:
-                    logging.warning("close for %s NOT filled (status=%s) — left open, pending self-heal",
-                                    sp.key, fill["status"])
-                    orders.append({**fill, "pnl": None, "reason": f"{action} (unfilled)"})
-                    # Track it: if the capped combo fills after this poll, the next run books it
-                    # from the real IB fill instead of leaving a phantom (the 2026-08-21 SBUX case).
-                    state.pending_orders.append({"action": "close", "permId": fill.get("permId", 0),
-                                                 "spread": asdict(sp), "placed_date": today,
-                                                 "order_ref": fill.get("order_ref", "")})
+                orders.append(book_close(state, sp, fill, action, today))
 
         # CIRCUIT BREAKER — here, AFTER management, so it can see UNREALISED P&L from the live
         # marks just fetched. Realised-only was blind to exactly the drawdowns that matter: a
@@ -682,17 +712,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                                      "bid": bid, "ask": ask, "ratio": ratio})
                     continue
                 fill = broker.open_spread(sp)
-                if fill["status"] in ("Filled", "Submitted", "PreSubmitted"):
-                    credit = fill["net_price"] if fill["net_price"] is not None else s.credit
-                    state.record_open(sp, credit, today, order_ref=fill.get("order_ref", ""),
-                                      exec_ids=fill.get("exec_ids"))
+                if book_open(state, sp, fill, s.credit, today):
                     orders.append(fill); open_tickers.add(s.ticker); sect_count[_sect] += 1; room -= 1
-                    if fill["status"] != "Filled":
-                        # Booked optimistically off a non-terminal status. Track it so the next run
-                        # confirms it actually filled at IB, and reverses the booking if it did not.
-                        state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),
-                                                     "spread": asdict(sp), "placed_date": today,
-                                                     "order_ref": fill.get("order_ref", "")})
 
         # 2b) GATE COUNTERFACTUAL — shadow the trades the gate blocked.
         #
