@@ -114,13 +114,19 @@ class OptionsState:
     def has(self, key: str) -> bool:
         return any(s.key == key for s in self.open_spreads)
 
-    def record_open(self, sp: OpenSpread, fill_credit: float, today: str) -> None:
+    # order_ref / exec_ids link each entry to IB's own records (Flex orderReference / ibExecID).
+    # exec_ids are empty for a fill booked by the pending self-heal on a LATER run: the API only
+    # returns the current day's executions. Such a trade still matches through order_ref.
+    def record_open(self, sp: OpenSpread, fill_credit: float, today: str,
+                    order_ref: str = "", exec_ids: list[str] | None = None) -> None:
         sp.entry_credit = fill_credit
         self.open_spreads.append(sp)
         self.trade_log.append({"date": today, "action": "OPEN", "key": sp.key,
-                               "contracts": sp.contracts, "credit": fill_credit})
+                               "contracts": sp.contracts, "credit": fill_credit,
+                               "order_ref": order_ref, "exec_ids": list(exec_ids or [])})
 
-    def record_close(self, sp: OpenSpread, close_value: float, today: str, reason: str) -> float:
+    def record_close(self, sp: OpenSpread, close_value: float, today: str, reason: str,
+                     order_ref: str = "", exec_ids: list[str] | None = None) -> float:
         """close_value = per-share debit paid to close. Books realized P&L, removes the spread."""
         pnl = (sp.entry_credit - close_value) * 100 * sp.contracts
         self.realized_pnl += pnl
@@ -130,7 +136,8 @@ class OptionsState:
                                "close_value": close_value, "pnl": pnl, "reason": reason,
                                "entry_credit": sp.entry_credit, "peak_value": peak,
                                "peak_mult": (peak / sp.entry_credit) if sp.entry_credit else None,
-                               "contracts": sp.contracts})
+                               "contracts": sp.contracts,
+                               "order_ref": order_ref, "exec_ids": list(exec_ids or [])})
         return pnl
 
     def stop_counterfactual(self, stop_mult: float = 2.0) -> dict:

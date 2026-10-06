@@ -409,14 +409,15 @@ def _resolve_pending(broker, state, today: str) -> None:
                     price = sp.entry_credit                       # last resort: breakeven, flagged
                 pnl = state.record_close(sp, float(price), today,
                     f"self-heal: CLOSE filled at IB after the poll returned; booked at "
-                    f"{'fill' if (info and info[1]) else 'mark/breakeven'} {float(price):.4f}")
+                    f"{'fill' if (info and info[1]) else 'mark/breakeven'} {float(price):.4f}",
+                    order_ref=p.get("order_ref", ""))
                 logging.warning("self-heal: booked late CLOSE %s @ %.4f (pnl %.2f)",
                                 sp.key, float(price), pnl)
         else:  # open
             if held:                                              # open filled
                 if not state.has(sp.key):
                     credit = info[1] if (info and info[1]) else sp.entry_credit
-                    state.record_open(sp, float(credit), today)
+                    state.record_open(sp, float(credit), today, order_ref=p.get("order_ref", ""))
                     logging.warning("self-heal: booked late OPEN %s @ %.4f", sp.key, float(credit))
             elif age >= 1:                                        # never filled -> reverse optimistic booking
                 if state.has(sp.key):
@@ -492,7 +493,9 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 # on 2026-08-07, then never filled). Leave an unfilled close open so it is
                 # retried / reconciled next run rather than booked off the mark.
                 if fill["status"] == "Filled" and fill["net_price"] is not None:
-                    pnl = state.record_close(sp, fill["net_price"], today, action)
+                    pnl = state.record_close(sp, fill["net_price"], today, action,
+                                             order_ref=fill.get("order_ref", ""),
+                                             exec_ids=fill.get("exec_ids"))
                     orders.append({**fill, "pnl": pnl, "reason": action})
                 else:
                     logging.warning("close for %s NOT filled (status=%s) — left open, pending self-heal",
@@ -501,7 +504,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                     # Track it: if the capped combo fills after this poll, the next run books it
                     # from the real IB fill instead of leaving a phantom (the 2026-08-21 SBUX case).
                     state.pending_orders.append({"action": "close", "permId": fill.get("permId", 0),
-                                                 "spread": asdict(sp), "placed_date": today})
+                                                 "spread": asdict(sp), "placed_date": today,
+                                                 "order_ref": fill.get("order_ref", "")})
 
         # CIRCUIT BREAKER — here, AFTER management, so it can see UNREALISED P&L from the live
         # marks just fetched. Realised-only was blind to exactly the drawdowns that matter: a
@@ -680,13 +684,15 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 fill = broker.open_spread(sp)
                 if fill["status"] in ("Filled", "Submitted", "PreSubmitted"):
                     credit = fill["net_price"] if fill["net_price"] is not None else s.credit
-                    state.record_open(sp, credit, today)
+                    state.record_open(sp, credit, today, order_ref=fill.get("order_ref", ""),
+                                      exec_ids=fill.get("exec_ids"))
                     orders.append(fill); open_tickers.add(s.ticker); sect_count[_sect] += 1; room -= 1
                     if fill["status"] != "Filled":
                         # Booked optimistically off a non-terminal status. Track it so the next run
                         # confirms it actually filled at IB, and reverses the booking if it did not.
                         state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),
-                                                     "spread": asdict(sp), "placed_date": today})
+                                                     "spread": asdict(sp), "placed_date": today,
+                                                     "order_ref": fill.get("order_ref", "")})
 
         # 2b) GATE COUNTERFACTUAL — shadow the trades the gate blocked.
         #

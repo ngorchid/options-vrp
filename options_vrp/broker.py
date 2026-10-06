@@ -134,10 +134,26 @@ class OptionsBroker:
         st = trade.orderStatus.status
         fp = trade.orderStatus.avgFillPrice or None
         perm = int(getattr(trade.order, "permId", 0) or 0)   # stable across runs; lets a late fill be resolved
-        logging.info("%s %dx %s %g/%gp -> %s%s", "OPEN" if opening else "CLOSE",
+        ex = self._exec_ids(trade) if st == "Filled" else []
+        logging.info("%s %dx %s %g/%gp -> %s%s  exec %s", "OPEN" if opening else "CLOSE",
                      sp.contracts, sp.ticker, sp.short_strike, sp.long_strike, st,
-                     f" @ {fp}" if fp else "")
-        return {**base, "net_price": abs(float(fp)) if fp else None, "status": st, "permId": perm}
+                     f" @ {fp}" if fp else "", ",".join(ex) or "-")
+        return {**base, "net_price": abs(float(fp)) if fp else None, "status": st, "permId": perm,
+                "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""}
+
+    def _exec_ids(self, trade, wait: float = 3.0) -> list[str]:
+        """IB execution ids of a filled order (one per leg fill for a combo): the key that matches
+        `ibExecID` in the Flex records (verified 2026-10-06; the permId does NOT match Flex's
+        ibOrderID). execDetails can trail the Filled status by a moment, so wait briefly.
+        Never raises -- an id is evidence, not a precondition."""
+        try:
+            waited = 0.0
+            while not getattr(trade, "fills", None) and waited < wait:
+                self.ib.sleep(0.5)
+                waited += 0.5
+            return [f.execution.execId for f in (getattr(trade, "fills", None) or [])]
+        except Exception:  # noqa: BLE001
+            return []
 
     def quote_spread(self, sp: OpenSpread, wait: float = 3.0) -> tuple[float | None, float | None]:
         """Live BID/ASK for the vertical as a COMBO.
