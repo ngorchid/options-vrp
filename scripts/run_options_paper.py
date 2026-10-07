@@ -30,7 +30,7 @@ from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState, ShadowSpread  # noqa: E402
-from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+from risk_guard import (RiskLimits, documented_sizing, log_sizing,  # noqa: E402
                         code_version,
                         check_allocations, check_order,
                         install_alert_collector, missed_runs, push_if_alerts,
@@ -257,16 +257,11 @@ VOL_PRIOR = 0.063
 # is 1.80 sigma and slow, there is nothing for a drawdown trigger to catch, and it should sit
 # beyond the historical range so it only speaks when something is genuinely wrong.
 BREAKER_SIGMAS = (2.0, 2.6, 3.2)      # -> 12.5% / 16.3% / 20.0% at VOL_PRIOR
-# BASE CAPITAL is no longer set here. It is this sleeve's share of live account NetLiquidation,
-# from the validated table in risk_guard.ALLOCATIONS — see `allocated_budget`. The old hard-coded
-# $75,000 was chosen from the capital sweep against a $50k account, which meant three sleeves
-# holding $50k + $75k + $100k of independently-set budget on one $50k account: 74% of NAV in
-# maintenance, tripping `no_new_risk` on an ordinary day with nothing able to see it.
-#
-# The sweep's finding still holds and is now reached automatically: peak margin is structurally
-# max_positions x risk_per_trade = 6 x 3% = 18% of budget, and because the budget tracks NetLiq,
-# this sleeve arrives at its measured $75-100k plateau as the account grows, with no edit.
-# `BUDGET` in .env still overrides for a deliberate one-off, and says so in the log.
+# BASE CAPITAL is not set here. Since 2026-10-07 the sizing budget is read from
+# config/capital_bases.json (risk_guard.documented_sizing), the single source for sizing budgets and
+# return bases; an env BUDGET still overrides but is WARNED about when it differs, and every run
+# logs the budget in use. risk_guard.ALLOCATIONS are guard ceilings only. Peak margin stays
+# structurally max_positions x risk_per_trade = 6 x 3% = 18% of budget.
 
 
 def _parse_gated(spec: str) -> dict[str, float]:
@@ -305,21 +300,14 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
     # live in one validated table (risk_guard.ALLOCATIONS) whose summed peak margin must leave
     # >= 40% cushion, so the three sleeves can no longer be resized independently into a
     # combination that does not fit -- which is what $50k + $75k + $100k of budget on a $50k
-    # account was. BUDGET in .env still overrides, for a deliberate one-off.
+    # account was. Since 2026-10-07 the budget comes from config/capital_bases.json, the single
+    # source for sizing (an env BUDGET still overrides, but is WARNED about when it differs);
+    # ALLOCATIONS stays a set of guard ceilings, checked in log_sizing, never a budget source.
     _alloc_ok = check_allocations()
     if not _alloc_ok:
         logging.error("ALLOCATION: %s", _alloc_ok.reason)
-    _override = os.getenv("BUDGET")
-    if _override:
-        budget = float(_override)
-        logging.info("budget: $%s from BUDGET override — allocation table BYPASSED",
-                     f"{budget:,.0f}")
-    else:
-        budget, note = allocated_budget("options-vrp",
-                                        getattr(state, "last_net_liq", 0.0) or None,
-                                        float(os.getenv("NOMINAL_NAV", str(NOMINAL_NAV))),
-                                        step=float(os.getenv("BUDGET_STEP", "0.10")))
-        logging.info("budget: %s", note)
+    budget, bsrc = documented_sizing(ROOT, "options-vrp")
+    log_sizing("options-vrp", budget, bsrc, getattr(state, "last_net_liq", 0.0) or None)
     return OptionsConfig(
         budget=budget,
         regime_thr=float(os.getenv("REGIME_THR", "99")),   # 99 = gate off; see .env.example
