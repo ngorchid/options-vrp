@@ -33,7 +33,7 @@ from options_vrp.state import OpenSpread, OptionsState, ShadowSpread  # noqa: E4
 from risk_guard import (RiskLimits, documented_sizing, log_sizing, HALT_HARD,  # noqa: E402
                         code_version,
                         check_allocations, check_order,
-                        install_alert_collector, missed_runs, push_if_alerts,
+                        install_alert_collector, missed_runs, push_if_alerts, email_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, liquidity_check, MarginLimits,
                         write_equity, book_drawdown, book_vol,
@@ -176,6 +176,7 @@ def run_safety_only(cfg: OptionsConfig, port: int, client_id: int) -> list[dict]
     if not broker.connect():
         logging.error("HALT_ALL: IB connect failed — assignment unwind did NOT run")
         escalate_assignments(state, today, "HALT_ALL")
+        email_if_alerts(ALERTS, "Options VRP HALT_ALL", today, prefer="ASSIGNED")
         push_if_alerts(ALERTS, "Options VRP")
         return []
     acts: list[dict] = []
@@ -187,6 +188,10 @@ def run_safety_only(cfg: OptionsConfig, port: int, client_id: int) -> list[dict]
         state.save(STATE_FILE)
         logging.info("HALT_ALL safety pass done: %d unwind order(s), %d open spread(s) left as they are",
                      len(acts), len(state.open_spreads))
+        # No daily report runs under HALT_ALL: this email is the only channel when Pushbullet
+        # is not configured (it is not on the live machine). The halt itself is an ERROR, so it
+        # is sent on every halted run -- a forgotten halt stays visible.
+        email_if_alerts(ALERTS, "Options VRP HALT_ALL", today, prefer="ASSIGNED")
         push_if_alerts(ALERTS, "Options VRP")
     finally:
         broker.disconnect()
@@ -655,7 +660,10 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
     broker = make_broker(port=port, client_id=client_id, dry_run=False)
     logging.info("run id %s — orders tagged orderRef=%s", RUN_ID, ORDER_REF)
     if not broker.connect():
-        logging.error("IB connect failed — aborting."); return
+        logging.error("IB connect failed — aborting.")
+        escalate_assignments(OptionsState.load(STATE_FILE), today)
+        email_if_alerts(ALERTS, "Options VRP", today, prefer="ASSIGNED")
+        return
     state = OptionsState.load(STATE_FILE); state.ensure_inception(today)
     backfill_exec_ids(state, today)
     orders: list[dict] = []
@@ -992,6 +1000,12 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         send_report(state, values, orders, res.regime_ratio, res.regime_open, today,
                     alerts=ALERTS)
         push_if_alerts(ALERTS, "Options VRP")
+    except Exception:
+        # A crash never reaches send_report: email what was collected (an assignment alert
+        # included), then let the error propagate as before.
+        logging.exception("run_live crashed")
+        email_if_alerts(ALERTS, "Options VRP CRASHED", today, prefer="ASSIGNED")
+        raise
     finally:
         broker.disconnect()
     if rejected:
@@ -1025,6 +1039,8 @@ def main() -> None:
                       "21-DTE time stop and the ASSIGNMENT unwind did NOT run.", _hwhy)
         escalate_assignments(OptionsState.load(STATE_FILE), datetime.now().strftime("%Y-%m-%d"),
                              "HALT_HARD")
+        email_if_alerts(ALERTS, "Options VRP HALT_HARD", datetime.now().strftime("%Y-%m-%d"),
+                        prefer="ASSIGNED")
         push_if_alerts(ALERTS, "Options VRP")
         return
     if _halt == HALT_ALL:
