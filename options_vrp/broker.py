@@ -139,7 +139,29 @@ class OptionsBroker:
                      sp.contracts, sp.ticker, sp.short_strike, sp.long_strike, st,
                      f" @ {fp}" if fp else "", ",".join(ex) or "-")
         return {**base, "net_price": abs(float(fp)) if fp else None, "status": st, "permId": perm,
-                "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""}
+                "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or "",
+                "conids": [int(getattr(short_leg, "conId", 0) or 0), int(getattr(long_leg, "conId", 0) or 0)],
+                "commission": self._commission(trade) if st == "Filled" else None,
+                "currency": "USD"}
+
+    def _commission(self, trade, wait: float = 3.0) -> float | None:
+        """Total IB commission of a filled order, from the commission reports that follow the
+        executions (2026-10-07). A report counts only once IB has sent it (its execId is set).
+        None when they have not all arrived -- a missing value is recorded as missing and never
+        holds up or blocks the trade."""
+        try:
+            waited = 0.0
+            while True:
+                fills = list(getattr(trade, "fills", None) or [])
+                reps = [getattr(f, "commissionReport", None) for f in fills]
+                if fills and all(r is not None and getattr(r, "execId", "") for r in reps):
+                    return round(sum(float(r.commission) for r in reps), 4)
+                if waited >= wait:
+                    return None
+                self.ib.sleep(0.5)
+                waited += 0.5
+        except Exception:  # noqa: BLE001
+            return None
 
     def _exec_ids(self, trade, wait: float = 3.0) -> list[str]:
         """IB execution ids of a filled order (one per leg fill for a combo): the key that matches
@@ -305,7 +327,10 @@ class OptionsBroker:
         logging.info("%s %s %g %s -> %s%s exec %s", label, action, qty, getattr(q[0], "symbol", ""),
                      st, f" @ {fp}" if fp else "", ",".join(ex) or "-")
         return {**base, "status": st, "price": float(fp) if fp else None, "exec_ids": ex,
-                "order_ref": getattr(order, "orderRef", "") or ""}
+                "order_ref": getattr(order, "orderRef", "") or "",
+                "conids": [int(getattr(q[0], "conId", 0) or 0)],
+                "commission": self._commission(trade) if st == "Filled" else None,
+                "currency": getattr(q[0], "currency", "") or "USD"}
 
     def sell_stock(self, ticker: str, shares: float, label: str = "SAFETY: assignment unwind") -> dict:
         from ib_insync import Stock

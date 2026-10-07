@@ -135,7 +135,10 @@ def book_stock_sale(state, sp, price: float, today: str, fill: dict, mult: int =
                             "contracts": n, "shares": mult * n, "price": price, "pnl": pnl,
                             "reason": "SAFETY: assignment unwind",
                             "order_ref": fill.get("order_ref", ""),
-                            "exec_ids": list(fill.get("exec_ids") or [])})
+                            "exec_ids": list(fill.get("exec_ids") or []),
+                            "conids": list(fill.get("conids") or []),
+                            "commission": fill.get("commission"),
+                            "currency": fill.get("currency") or ""})
     return pnl
 
 
@@ -148,7 +151,10 @@ def book_long_sale(state, sp, price: float, today: str, fill: dict, mult: int = 
                             "contracts": n, "strike": sp.long_strike, "price": price, "pnl": pnl,
                             "reason": "SAFETY: assignment unwind",
                             "order_ref": fill.get("order_ref", ""),
-                            "exec_ids": list(fill.get("exec_ids") or [])})
+                            "exec_ids": list(fill.get("exec_ids") or []),
+                            "conids": list(fill.get("conids") or []),
+                            "commission": fill.get("commission"),
+                            "currency": fill.get("currency") or ""})
     remaining = sp.contracts - n
     if remaining <= 0:
         state.open_spreads = [s for s in state.open_spreads if s.key != sp.key]

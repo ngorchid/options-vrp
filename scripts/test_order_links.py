@@ -41,18 +41,22 @@ class FakeIB:
     """Fills every combo at once with a BAG execution plus one per leg; `fills_after` sleeps
     before the execDetails arrive."""
 
-    def __init__(self, fills_after: int = 0):
+    def __init__(self, fills_after: int = 0, reports: bool = True):
         self.sent, self.n, self.fills_after, self._pending = [], 0, fills_after, None
+        self.reports = reports
 
     def qualifyContracts(self, *cs):
         for i, c in enumerate(cs):
-            c.conId = 100 + i
+            c.conId = int(float(getattr(c, "strike", 0) or 0) * 10) or (100 + i)   # leg-specific
         return list(cs)
 
     def placeOrder(self, contract, order):
         self.n += 1
         self.sent.append(order)
-        fills = [NS(execution=NS(execId=f"0002.{self.n}.0{k}.01")) for k in (1, 2, 3)]
+        fills = [NS(execution=NS(execId=f"0002.{self.n}.0{k}.01"),
+                    commissionReport=NS(execId=f"0002.{self.n}.0{k}.01" if self.reports else "",
+                                        commission=(0.0 if k == 1 else 1.30)))
+                 for k in (1, 2, 3)]                 # the combo-level fill carries no commission
         t = NS(order=order, fills=[] if self.fills_after else fills,
                orderStatus=NS(status="Filled", avgFillPrice=-0.74, filled=order.totalQuantity))
         self._pending = [t, fills, self.fills_after]
@@ -93,7 +97,10 @@ cl = b.close_spread(spread(), wait=2)
 check("a combo CLOSE carries orderRef", ib.sent[-1].orderRef == REF, repr(ib.sent[-1].orderRef))
 nb = OptionsBroker.__new__(OptionsBroker)          # built without __init__: no order_ref attribute
 nb.ib, nb.dry_run = FakeIB(), False
-r = nb.open_spread(spread(), wait=2)
+try:
+    r = nb.open_spread(spread(), wait=2)
+except Exception as e:  # noqa: BLE001 -- a crash is a FAILED check here, not a test crash
+    r = {"status": f"crashed: {type(e).__name__}: {e}"}
 check("a broker without a tag still places the order (a tag never blocks a trade)",
       r.get("status") == "Filled", str(r))
 
@@ -123,6 +130,15 @@ check("CLOSE keeps orderRef and all execution ids",
 # RUNNER WIRING. Everything above hands the broker its tag by hand, so it cannot see the runner
 # forgetting to: deleting that one line in run_options_paper.py sent every order out untagged
 # while all of the above stayed green. These pin the runner's own wiring.
+print("\nCONID / COMMISSION / CURRENCY (additive, 2026-10-07)")
+check("a combo fill carries both legs' conids (short, long), total commission and currency",
+      op.get("conids") == [2630, 2560], str(op))
+check("...commission = sum over the combo and leg reports (0 + 1.30 + 1.30)",
+      abs((op.get("commission") or 0) - 2.60) < 1e-9 and op.get("currency") == "USD", str(op))
+_nr = broker(FakeIB(reports=False)).open_spread(spread(), wait=2)
+check("commission reports that never arrive -> None, the combo is still Filled",
+      _nr.get("status") == "Filled" and _nr.get("commission") is None, str(_nr))
+
 print("\nRUNNER WIRING")
 import re  # noqa: E402
 from dataclasses import asdict  # noqa: E402
@@ -157,6 +173,9 @@ check("a dead OPEN (Cancelled) is not booked",
       runner.book_open(OptionsState(), spread(), {**op, "status": "Cancelled"}, 0.5, "x") is False, "")
 _row = runner.book_close(_st, spread(), cl, "profit_target", "2026-10-20")
 _log = _st.trade_log[-1]
+check("book_open writes conids, commission and currency into the OPEN row",
+      _st.trade_log[0].get("conids") == op["conids"] and abs((_st.trade_log[0].get("commission") or 0) - 2.60) < 1e-9
+      and _st.trade_log[0].get("currency") == "USD", str(_st.trade_log[0]))
 check("book_close writes the CLOSE with its orderRef and all execution ids",
       _log.get("action") == "CLOSE" and _log.get("order_ref") == REF
       and _log.get("exec_ids") == cl["exec_ids"] and len(cl["exec_ids"]) == 3, str(_log))

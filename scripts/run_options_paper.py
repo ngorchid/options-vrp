@@ -185,7 +185,8 @@ def book_open(state, sp, fill: dict, fallback_credit: float, today: str) -> bool
         return False
     credit = fill["net_price"] if fill["net_price"] is not None else fallback_credit
     state.record_open(sp, credit, today, order_ref=fill.get("order_ref", ""),
-                      exec_ids=fill.get("exec_ids"))
+                      exec_ids=fill.get("exec_ids"), conids=fill.get("conids"),
+                      commission=fill.get("commission"), currency=fill.get("currency") or "")
     if fill["status"] != "Filled":
         state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),
                                      "spread": asdict(sp), "placed_date": today,
@@ -205,7 +206,9 @@ def book_close(state, sp, fill: dict, action: str, today: str) -> dict:
     if fill["status"] == "Filled" and fill["net_price"] is not None:
         pnl = state.record_close(sp, fill["net_price"], today, action,
                                  order_ref=fill.get("order_ref", ""),
-                                 exec_ids=fill.get("exec_ids"))
+                                 exec_ids=fill.get("exec_ids"), conids=fill.get("conids"),
+                                 commission=fill.get("commission"),
+                                 currency=fill.get("currency") or "")
         return {**fill, "pnl": pnl, "reason": action}
     logging.warning("close for %s NOT filled (status=%s) — left open, pending self-heal",
                     sp.key, fill["status"])

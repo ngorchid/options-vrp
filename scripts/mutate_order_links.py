@@ -1,42 +1,24 @@
-"""Mutation-test `scripts/test_order_links.py`: seed real faults, demand the suite catches them.
+"""Mutation-test `scripts/test_order_links.py`: the order -> IB record links (orderRef, execution ids, conid, commission, currency).
 
-WHY. The order -> IB-record links (orderRef tag, execution ids) fail SILENTLY: an untagged order
-still fills, a dropped execution id still books. The first version of test_order_links.py handed
-the broker its tag and the ledger its ids by hand, so deleting the runner's one tagging line, or
-dropping the ids on the way into the ledger, survived with the suite green (measured 2026-10-06).
-A passing suite is only evidence if breaking each link on purpose makes it fail.
-
-Never edits the real files: the repo's code (no data, results, .env or .git) is copied to a temp
-dir once and each mutant is written there, so an interrupted run cannot leave a broken file for
-the scheduled task.
-
-Non-zero exit if any fault survives, a pattern no longer matches exactly once (the code moved:
-update this file), or a mutant does not compile (it would be "caught" by the SyntaxError alone).
+Seeds real faults into a TEMP COPY of the repo (the real files are never edited) and demands the
+suite catches every one. Engine: _mutate_repo_core.py.
 
 Run: python scripts/mutate_order_links.py
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-SUITE = [sys.executable, "scripts/test_order_links.py"]
-IGNORE = shutil.ignore_patterns(".git", "data", "results", "__pycache__", ".idea", ".claude",
-                                ".env", ".venv", "venv", "*.parquet", "*.pkl")
+from _mutate_repo_core import run
 
-# (file, find, replace, what the fault means)
 MUTATIONS = [
     ('options_vrp/broker.py',
-     '            order.orderRef = self.order_ref\n',
-     '            pass\n',
+     '        if getattr(self, "order_ref", None):            # a missing tag must never stop an order\n            order.orderRef = self.order_ref\n        trade = self.ib.placeOrder(bag, order)',
+     '        trade = self.ib.placeOrder(bag, order)',
      'broker never stamps orderRef on the combo'),
     ('options_vrp/broker.py',
-     'if getattr(self, "order_ref", None):',
-     'if self.order_ref:',
+     '        if getattr(self, "order_ref", None):            # a missing tag must never stop an order\n            order.orderRef = self.order_ref\n        trade = self.ib.placeOrder(bag, order)',
+     '        if self.order_ref:            # a missing tag must never stop an order\n            order.orderRef = self.order_ref\n        trade = self.ib.placeOrder(bag, order)',
      'a broker without a tag raises (a missing tag BLOCKS the trade)'),
     ('options_vrp/broker.py',
      'while not getattr(trade, "fills", None) and waited < wait:',
@@ -47,8 +29,8 @@ MUTATIONS = [
      'return [f.execution.execId for f in (getattr(trade, "fills", None) or [])][:1]',
      "only the combo's execution id kept, the legs' dropped"),
     ('options_vrp/broker.py',
-     '"exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""}',
-     '"exec_ids": ex, "order_ref": ""}',
+     '                "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or "",\n                "conids": [int(getattr(short_leg',
+     '                "exec_ids": ex, "order_ref": "",\n                "conids": [int(getattr(short_leg',
      'a fill drops its orderRef'),
     ('scripts/run_options_paper.py',
      '    b.order_ref = ORDER_REF\n',
@@ -63,12 +45,12 @@ MUTATIONS = [
      'ORDER_REF = f"vrp:{RUN_ID}"',
      'RUNNER: tag names the wrong strategy'),
     ('scripts/run_options_paper.py',
-     '    state.record_open(sp, credit, today, order_ref=fill.get("order_ref", ""),\n                      exec_ids=fill.get("exec_ids"))',
-     '    state.record_open(sp, credit, today)',
+     '    state.record_open(sp, credit, today, order_ref=fill.get("order_ref", ""),\n                      exec_ids=fill.get("exec_ids"), conids=fill.get("conids"),',
+     '    state.record_open(sp, credit, today, conids=fill.get("conids"),',
      'RUNNER: OPEN booked without tag or execution ids'),
     ('scripts/run_options_paper.py',
-     '        pnl = state.record_close(sp, fill["net_price"], today, action,\n                                 order_ref=fill.get("order_ref", ""),\n                                 exec_ids=fill.get("exec_ids"))',
-     '        pnl = state.record_close(sp, fill["net_price"], today, action)',
+     'order_ref=fill.get("order_ref", ""),\n                                 exec_ids=fill.get("exec_ids"), conids=fill.get("conids"),',
+     'conids=fill.get("conids"),',
      'RUNNER: CLOSE booked without tag or execution ids'),
     ('scripts/run_options_paper.py',
      '        state.pending_orders.append({"action": "open", "permId": fill.get("permId", 0),\n                                     "spread": asdict(sp), "placed_date": today,\n                                     "order_ref": fill.get("order_ref", "")})',
@@ -95,65 +77,26 @@ MUTATIONS = [
      '                if False:',
      'RUNNER: run_live stops booking opens'),
     ('options_vrp/state.py',
-     '"order_ref": order_ref, "exec_ids": list(exec_ids or [])})\n\n    def record_close',
-     '"order_ref": order_ref, "exec_ids": []})\n\n    def record_close',
+     '"order_ref": order_ref, "exec_ids": list(exec_ids or []),\n                               "conids": list(conids or []), "commission": commission,\n                               "currency": currency})\n\n    def record_close',
+     '"order_ref": order_ref, "exec_ids": [],\n                               "conids": list(conids or []), "commission": commission,\n                               "currency": currency})\n\n    def record_close',
      'trade_log OPEN drops the execution ids'),
+    ('options_vrp/broker.py',
+     '                "conids": [int(getattr(short_leg, "conId", 0) or 0), int(getattr(long_leg, "conId", 0) or 0)],',
+     '                "conids": [int(getattr(long_leg, "conId", 0) or 0), int(getattr(short_leg, "conId", 0) or 0)],',
+     'leg conids recorded in the wrong order'),
+    ('options_vrp/broker.py',
+     '                "commission": self._commission(trade) if st == "Filled" else None,\n                "currency": "USD"}',
+     '                "commission": None,\n                "currency": "USD"}',
+     'combo commission never recorded'),
+    ('options_vrp/broker.py',
+     '                if fills and all(r is not None and getattr(r, "execId", "") for r in reps):',
+     '                if fills:',
+     'commission reports counted before IB sent them'),
+    ('scripts/run_options_paper.py',
+     '                      exec_ids=fill.get("exec_ids"), conids=fill.get("conids"),\n                      commission=fill.get("commission"), currency=fill.get("currency") or "")',
+     '                      exec_ids=fill.get("exec_ids"))',
+     'book_open drops conids/commission/currency'),
 ]
 
-
-def main() -> int:
-    base = subprocess.run(SUITE, cwd=ROOT, capture_output=True, text=True)
-    if base.returncode != 0:
-        print("the suite does not pass on the ORIGINAL code — fix that first")
-        print(base.stdout[-2000:])
-        return 1
-    print("=" * 100)
-    print(f"  {len(MUTATIONS)} seeded faults; every one must be CAUGHT\n")
-    results = []
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp) / "repo"
-        shutil.copytree(ROOT, work, ignore=IGNORE)
-        for rel, find, repl, why in MUTATIONS:
-            f = work / rel
-            orig = f.read_text(encoding="utf-8")
-            n = orig.count(find)
-            if n != 1:
-                results.append((why, None))
-                print(f"  [ ?? ] {why:80} PATTERN {'MISSING' if n == 0 else f'AMBIGUOUS x{n}'}")
-                continue
-            mutant = orig.replace(find, repl, 1)
-            try:                    # a mutant that does not even compile is not a test of anything
-                compile(mutant, rel, "exec")
-            except SyntaxError as e:
-                results.append((why, None))
-                print(f"  [ ?? ] {why:80} INVALID MUTANT ({e.msg})")
-                continue
-            f.write_text(mutant, encoding="utf-8")
-            try:
-                r = subprocess.run(SUITE, cwd=work, capture_output=True, text=True)
-            finally:
-                f.write_text(orig, encoding="utf-8")
-            caught = r.returncode != 0
-            results.append((why, caught))
-            print(f"  [{'ok  ' if caught else 'FAIL'}] {why:80} "
-                  f"{'CAUGHT' if caught else '*** SURVIVED ***'}")
-    survived = [w for w, c in results if c is False]
-    missing = [w for w, c in results if c is None]
-    print("\n" + "=" * 100)
-    if missing:
-        print(f"{len(missing)} mutation(s) could not be applied (pattern moved or mutant invalid) "
-              "— update this file:")
-        for w in missing:
-            print("   " + w)
-    if survived:
-        print(f"{len(survived)} MUTATION(S) SURVIVED — those cases cannot fail and are decoration:")
-        for w in survived:
-            print("   " + w)
-    if survived or missing:
-        return 1
-    print(f"all {len(MUTATIONS)} seeded faults were caught; the real files were never modified")
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run("test_order_links.py", MUTATIONS))
