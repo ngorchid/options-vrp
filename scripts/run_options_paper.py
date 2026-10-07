@@ -64,6 +64,25 @@ def make_broker(**kw):
     return b
 
 
+RECORDS_DIR = Path(os.getenv("IB_RECORDS_DIR", r"C:\Users\Nicolas\IB-records"))
+
+
+def backfill_exec_ids(state, today: str) -> int:
+    """Write the real IB execution ids the nightly two-way check found into this sleeve's own
+    tag-only trade_log rows (pending self-heal). Bookkeeping only; a failure here is logged and
+    never stops the run."""
+    from options_vrp.audit import apply_exec_backfill, read_backfill
+    try:
+        n = apply_exec_backfill(state, read_backfill(RECORDS_DIR / "tables" / "exec_backfill.csv"),
+                                today)
+        if n:
+            logging.info("exec-id backfill: %d trade_log row(s) linked to IB's records", n)
+        return n
+    except Exception as e:  # noqa: BLE001
+        logging.warning("exec-id backfill skipped: %s", e)
+        return 0
+
+
 def book_open(state, sp, fill: dict, fallback_credit: float, today: str) -> bool:
     """Book an OPEN into the ledger with its link to IB's records. True if booked.
 
@@ -493,6 +512,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
     if not broker.connect():
         logging.error("IB connect failed — aborting."); return
     state = OptionsState.load(STATE_FILE); state.ensure_inception(today)
+    backfill_exec_ids(state, today)
     orders: list[dict] = []
     rejected: list[dict] = []
     try:
