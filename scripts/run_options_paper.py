@@ -30,7 +30,7 @@ from options_vrp.strategy import (  # noqa: E402
     _nearest_delta_strike, cost_ok, earnings_cutoff, manage_action, oi_threshold,
     pick_expiry)
 from options_vrp.state import OpenSpread, OptionsState, ShadowSpread  # noqa: E402
-from risk_guard import (RiskLimits, documented_sizing, log_sizing,  # noqa: E402
+from risk_guard import (RiskLimits, documented_sizing, log_sizing, HALT_HARD,  # noqa: E402
                         code_version,
                         check_allocations, check_order,
                         install_alert_collector, missed_runs, push_if_alerts,
@@ -88,8 +88,8 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
 
     SAFETY. Runs before management and consults NONE of the automated guards -- margin ceiling,
     circuit breaker, HALT_NEW, cost guard, risk checks all leave it alone; the orders carry the
-    label "SAFETY: assignment unwind". Only the manual HALT_ALL kill switch stops it, because
-    HALT_ALL exits before connecting at all. Before every sale the position is re-read from IB,
+    label "SAFETY: assignment unwind". It also runs under HALT_ALL (via run_safety_only); only
+    HALT_HARD -- no IB connection at all -- stops it. Before every sale the position is re-read from IB,
     so the unwind can never sell shares or puts the account does not hold (which would OPEN a
     short stock position or a naked put)."""
     from options_vrp import assignment as asg
@@ -155,6 +155,42 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
         logging.warning("ASSIGNMENT UNWIND %s: sold %d long %gP @ %.2f (P&L %+.0f) — unwind complete",
                         sp.key, n, sp.long_strike, f2["price"], pnl2)
     return actions
+
+
+def escalate_assignments(state, today: str, level: str = "") -> list[str]:
+    """Daily, escalating ERROR for every open assigned position (any halt level)."""
+    from options_vrp.assignment import escalation_notes
+    notes = escalation_notes(state.open_spreads, today, level)
+    for note in notes:
+        logging.error("%s", note)
+    return notes
+
+
+def run_safety_only(cfg: OptionsConfig, port: int, client_id: int) -> list[dict]:
+    """HALT_ALL (2026-10-07): no new risk and no normal management -- ONLY the SAFETY assignment
+    unwind, which is deterministic and strictly risk-reducing, plus the escalating alert. No
+    spread is opened, closed or managed; no circuit breaker, margin or cost logic runs."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    broker = make_broker(port=port, client_id=client_id, dry_run=False)
+    state = OptionsState.load(STATE_FILE)
+    if not broker.connect():
+        logging.error("HALT_ALL: IB connect failed — assignment unwind did NOT run")
+        escalate_assignments(state, today, "HALT_ALL")
+        push_if_alerts(ALERTS, "Options VRP")
+        return []
+    acts: list[dict] = []
+    try:
+        state.ensure_inception(today)
+        backfill_exec_ids(state, today)
+        acts = handle_assignments(broker, state, today)
+        escalate_assignments(state, today, "HALT_ALL")
+        state.save(STATE_FILE)
+        logging.info("HALT_ALL safety pass done: %d unwind order(s), %d open spread(s) left as they are",
+                     len(acts), len(state.open_spreads))
+        push_if_alerts(ALERTS, "Options VRP")
+    finally:
+        broker.disconnect()
+    return acts
 
 
 def book_unrealized(state, values: dict, put_marks: dict, stock_marks: dict) -> float:
@@ -627,6 +663,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
 
         # 0b) EARLY ASSIGNMENT -- detect, alert and unwind (SAFETY: no automated guard applies).
         orders.extend(handle_assignments(broker, state, today))
+        escalate_assignments(state, today)
 
         # 1) MANAGE open spreads
         values = broker.spread_values(state.open_spreads)
@@ -947,7 +984,8 @@ def main() -> None:
     args = ap.parse_args()
     cfg = _cfg(OptionsState.load(STATE_FILE))
 
-    # KILL SWITCH. HALT_ALL exits before connecting. HALT keeps MANAGEMENT running — profit
+    # KILL SWITCH (levels split 2026-10-07). HALT_HARD exits before connecting. HALT_ALL runs ONLY
+    # the SAFETY assignment unwind (run_safety_only). HALT keeps MANAGEMENT running — profit
     # targets and the 21-DTE time stop still fire — but opens nothing new. Blocking management
     # would leave short options running into expiry unmanaged, which is worse than whatever
     # prompted the halt.
@@ -956,11 +994,16 @@ def main() -> None:
     # thing you want to learn from a halted day's log, not discover a month later.
     code_version(ROOT)
     _halt, _hwhy = halt_state(ROOT)
-    if _halt == HALT_ALL:
-        logging.error("HALTED (all): %s — exiting without trading. NOTE: profit targets, the "
+    if _halt == HALT_HARD:
+        logging.error("HALTED (hard): %s — exiting without connecting. NOTE: profit targets, the "
                       "21-DTE time stop and the ASSIGNMENT unwind did NOT run.", _hwhy)
+        escalate_assignments(OptionsState.load(STATE_FILE), datetime.now().strftime("%Y-%m-%d"),
+                             "HALT_HARD")
         push_if_alerts(ALERTS, "Options VRP")
         return
+    if _halt == HALT_ALL:
+        logging.error("HALTED (all): %s — no new risk, no management; SAFETY assignment unwind "
+                      "ONLY", _hwhy)
     if _halt == HALT_NEW:
         logging.warning("HALTED (new risk): %s — managing open spreads only", _hwhy)
         cfg.max_positions = 0
@@ -973,6 +1016,9 @@ def main() -> None:
         dry_run(cfg); return
     if datetime.now().weekday() >= 5 and not args.force:
         logging.info("Weekend — skipping."); return
+    if _halt == HALT_ALL:
+        run_safety_only(cfg, args.port, args.client_id)
+        return
     run_live(cfg, args.port, args.client_id)
 
 

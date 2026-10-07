@@ -89,6 +89,31 @@ def detect(open_spreads, put_actual: dict | None, stock_detail: dict | None,
     return out
 
 
+def escalation_notes(open_spreads, today: str, level: str = "") -> list[str]:
+    """One line per open ASSIGNED position, escalating with its age in business days (day 1 = the
+    day it was recorded): OPEN -> ESCALATION (day 2) -> URGENT (day 3+). Raised on EVERY run,
+    under any halt level -- including HALT_HARD, where nothing can be unwound -- so an assigned
+    position can never sit forgotten behind a halt."""
+    import numpy as np
+    out = []
+    for sp in open_spreads:
+        n = int(getattr(sp, "assigned_contracts", 0) or 0)
+        if not n:
+            continue
+        since = getattr(sp, "assigned_date", "") or today
+        days = int(np.busday_count(since, today)) + 1 if since <= today else 1
+        sev = "URGENT" if days >= 3 else ("ESCALATION" if days == 2 else "OPEN")
+        will = ("nothing can be unwound under HALT_HARD — unwind by hand (DEPLOY.md)"
+                if level == "HALT_HARD" else
+                "the automatic unwind retries each run" if getattr(sp, "assigned_auto", False)
+                else "needs a MANUAL unwind (DEPLOY.md)")
+        out.append(f"ASSIGNED POSITION {sev} — day {days} since {since}: {sp.key}, {n} contract(s): "
+                   f"{'shares sold, ' if getattr(sp, 'assigned_stock_sold', False) else f'{MULT * n} {sp.ticker} shares + '}"
+                   f"{n} long {sp.long_strike:g}P still open"
+                   + (f" under {level}" if level else "") + f"; {will}")
+    return out
+
+
 def mark_assigned(state, a: Assignment, today: str) -> None:
     """Record the assignment on the spread and in the trade log (bookkeeping only)."""
     sp = next(s for s in state.open_spreads if s.key == a.key)

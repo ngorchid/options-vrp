@@ -100,14 +100,23 @@ flagged `SAFETY: assignment unwind` — no automated guard (margin ceiling, circ
    a normal spread.
 
 The assigned position is valued in the circuit breaker and the NAV snapshot until it is gone.
-**`HALT_ALL` still stops everything**, the unwind included: it is the manual kill switch.
+**Kill-switch levels (since 2026-10-07)** — files in the repo root (or `TRADING_HALT`):
+
+| Level | File / env | What still runs |
+|---|---|---|
+| `HALT` | `HALT` / `TRADING_HALT=1` | management (profit target, time stop, the assignment unwind); nothing new opened |
+| `HALT_ALL` | `HALT_ALL` / `TRADING_HALT=all` | **only** the SAFETY assignment unwind (`run_safety_only`): no opening, no management, no breaker/margin logic |
+| `HALT_HARD` | `HALT_HARD` / `TRADING_HALT=hard` | nothing — no IB connection; set it only if you suspect the system itself is misbehaving |
+
+Under every level an open assigned position raises a daily ERROR that escalates with its age
+(OPEN → ESCALATION on day 2 → URGENT from day 3), raised from saved state even under `HALT_HARD`.
 
 **When it does NOT unwind automatically** — the alert says "MANUAL unwind needed":
 
 - the stock position is larger than the delivery or priced differently (magic-formula also holds
   the name), so the runner cannot prove which shares are the sleeve's;
 - the short leg is gone but no stock is visible (closed by hand, or the delivery not yet shown);
-- `HALT_ALL` is set.
+- `HALT_HARD` is set (nothing connects; the escalating alert keeps reminding you).
 
 ### Manual unwind (same US session if at all possible)
 
