@@ -321,6 +321,31 @@ def _parse_gated(spec: str) -> dict[str, float]:
     return out
 
 
+def _regime_settings() -> tuple[float, dict[str, float]]:
+    """(global threshold, per-name thresholds): the decision in options_vrp.strategy
+    (REGIME_THR_DEFAULT / GATED_NAMES) unless the env overrides it. An override is honoured but
+    WARNED about, so a stale .env can never again silently re-enable the gate for every name."""
+    from options_vrp.strategy import GATED_NAMES, REGIME_THR_DEFAULT
+    thr, by_name = REGIME_THR_DEFAULT, dict(GATED_NAMES)
+    env_thr, env_names = os.getenv("REGIME_THR"), os.getenv("REGIME_THR_BY_NAME")
+    if env_thr is not None and env_thr.strip():
+        try:
+            thr = float(env_thr)
+        except ValueError:
+            logging.warning("REGIME_THR=%r is not a number — using the documented %.2f",
+                            env_thr, REGIME_THR_DEFAULT)
+    if env_names is not None:
+        by_name = _parse_gated(env_names)
+    if thr != REGIME_THR_DEFAULT:
+        logging.warning("REGIME_THR=%.2f from env overrides the documented decision (%.0f = gate "
+                        "OFF for the basket, options_vrp.strategy.REGIME_THR_DEFAULT) — the gate "
+                        "now applies to EVERY name", thr, REGIME_THR_DEFAULT)
+    if by_name != GATED_NAMES:
+        logging.warning("REGIME_THR_BY_NAME=%r from env overrides the documented per-name gates %s "
+                        "(options_vrp.strategy.GATED_NAMES)", env_names, GATED_NAMES)
+    return thr, by_name
+
+
 def _cfg(state: OptionsState | None = None) -> OptionsConfig:
     """BUDGET is the BASE capital; sizing compounds off this strategy's OWN realised P&L.
 
@@ -344,10 +369,11 @@ def _cfg(state: OptionsState | None = None) -> OptionsConfig:
         logging.error("ALLOCATION: %s", _alloc_ok.reason)
     budget, bsrc = documented_sizing(ROOT, "options-vrp")
     log_sizing("options-vrp", budget, bsrc, getattr(state, "last_net_liq", 0.0) or None)
+    regime_thr, regime_by_name = _regime_settings()
     return OptionsConfig(
         budget=budget,
-        regime_thr=float(os.getenv("REGIME_THR", "99")),   # 99 = gate off; see .env.example
-        regime_thr_by_name=_parse_gated(os.getenv("REGIME_THR_BY_NAME", "USO:1.00")),
+        regime_thr=regime_thr,                 # the decision lives in options_vrp.strategy
+        regime_thr_by_name=regime_by_name,
         vrp_min=float(os.getenv("VRP_MIN", "0.02")),
         stop_mult=float(os.getenv("STOP_MULT", "0")),
         max_cost_frac=float(os.getenv("MAX_COST_FRAC", "0.25")),

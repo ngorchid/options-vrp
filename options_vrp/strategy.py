@@ -146,20 +146,30 @@ DEFAULT_BASKET = [
 ]
 
 
+# REGIME GATE — the owner's decision, stated HERE as code (2026-10-07), not only as env defaults.
+# Until then it lived only in the runner's os.getenv() defaults, so the dataclass still defaulted
+# to the old gate-ON 1.00 and a stale `REGIME_THR=1.00` in the live .env silently re-enabled the
+# gate for EVERY name (it did, until 2026-10-07).
+#   * OFF for the basket (2026-08-28): the OPRA backtest measured the global gate as a cost, not a
+#     protection — gate OFF +0.85 Sharpe vs ON +0.62 at the corrected 6% cost, no drawdown benefit
+#     either way (-5,244 both), and 7 of the 8 largest losses were entered with it wide open. In
+#     equities VIX/VIX3M is a COINCIDENT stress detector: it inverts once the move is underway.
+#   * ON for the names whose stress shows in the term structure BEFORE the damage — a delayed
+#     reaction the gate can act on: crude (USO), 2026-09-08 (see the USO note in DEFAULT_BASKET).
+# Env REGIME_THR / REGIME_THR_BY_NAME still override, deliberately; the runner WARNS whenever they
+# differ from these constants. Change the decision here, with a dated note, not in an .env.
+REGIME_GATE_OFF = 99.0                        # a threshold this high can never close the gate
+REGIME_THR_DEFAULT = REGIME_GATE_OFF          # global: OFF
+GATED_NAMES: dict[str, float] = {"USO": 1.00}  # per-name: sell only while VIX/VIX3M < threshold
+
+
 @dataclass
 class OptionsConfig:
     basket: list[str] = field(default_factory=lambda: list(DEFAULT_BASKET))
-    regime_thr: float = 1.00          # sell only when VIX/VIX3M < this (contango)
-    # PER-NAME gate override, ticker -> threshold. Absent names use `regime_thr`.
-    # The gate used to be one global switch that emptied the whole book; it was turned OFF for
-    # everything on 2026-08-28 (REGIME_THR 1.00 -> 99) because the OPRA backtest measured it as
-    # a cost, not a protection: gate OFF +0.85 Sharpe vs ON +0.62 at the corrected 6% cost, with
-    # no drawdown benefit either way (-5,244 both), and 7 of the 8 largest losses were entered
-    # with it wide open. That verdict is EQUITY-specific — the gate is a coincident stress
-    # detector there. Oil may differ (see the USO note in DEFAULT_BASKET), so the switch is now
-    # per-name rather than all-or-nothing, which is the only way to run one name gated and the
-    # rest not. Set via REGIME_THR_BY_NAME, e.g. "USO:1.00".
-    regime_thr_by_name: dict[str, float] = field(default_factory=dict)
+    # Global gate threshold (sell only when VIX/VIX3M < this) and the per-name overrides; absent
+    # names use `regime_thr`. Defaults ARE the decision above — see REGIME_THR_DEFAULT/GATED_NAMES.
+    regime_thr: float = REGIME_THR_DEFAULT
+    regime_thr_by_name: dict[str, float] = field(default_factory=lambda: dict(GATED_NAMES))
     vrp_min: float = 0.02             # require ATM IV − RV20 above this (vol points): skip thin premium
     short_delta: float = 0.16         # short put ≈ 1σ
     long_delta: float = 0.10          # long put (defined-risk wing); nearer = narrower spread
