@@ -10,20 +10,53 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 
-def _rows(open_spreads, values) -> str:
+
+def _code_line() -> str:
+    """The commit this run used (risk_guard.code_version), as the report's last line."""
+    try:
+        from risk_guard import code_version_note
+        note = code_version_note()
+    except Exception:  # noqa: BLE001 -- reporting must never break the run
+        note = ""
+    return (f"<p style='color:#64748b;font-size:11px'>Code: "
+            f"{note or 'version not recorded'}</p>")
+
+def _rows(open_spreads, values, marks=None) -> str:
     if not open_spreads:
         return "<tr><td colspan=6>— no open spreads —</td></tr>"
+    from options_vrp.assignment import unrealized
     out = []
     for sp in open_spreads:
-        cv = values.get(sp.key)
-        unreal = (sp.entry_credit - cv) * 100 * sp.contracts if cv is not None else None
+        n_a = int(getattr(sp, "assigned_contracts", 0) or 0)
+        if n_a:
+            # ASSIGNED: no spread mark exists once the short leg is gone. Valued exactly as the
+            # breaker and the NAV snapshot value it (assignment.unrealized), never left blank.
+            unreal = unrealized(sp, *marks) if marks else None
+            mark = (f"ASSIGNED {n_a} of {sp.contracts}"
+                    + (" (shares sold)" if getattr(sp, "assigned_stock_sold", False) else ""))
+        else:
+            cv = values.get(sp.key)
+            unreal = (sp.entry_credit - cv) * 100 * sp.contracts if cv is not None else None
+            mark = "—" if cv is None else f"${cv*100:,.0f}"
         out.append(
             f"<tr><td>{sp.ticker}</td><td>{sp.expiry}</td>"
             f"<td>{sp.short_strike:g}/{sp.long_strike:g}p ×{sp.contracts}</td>"
             f"<td>${sp.entry_credit*100:,.0f}</td>"
-            f"<td>{'—' if cv is None else f'${cv*100:,.0f}'}</td>"
+            f"<td>{mark}</td>"
             f"<td>{'—' if unreal is None else f'${unreal:,.0f}'}</td></tr>")
     return "\n".join(out)
+
+
+def _open_assignments(state, today) -> str:
+    """Every open assigned position, or an explicit 'none' -- an empty block must never be
+    mistaken for a missing one."""
+    from options_vrp.assignment import escalation_notes
+    notes = escalation_notes(state.open_spreads, today)
+    if not notes:
+        return "<h3>Open assignments</h3><p>none</p>"
+    items = "".join(f"<li>{x}</li>" for x in notes)
+    return (f"<h3 style='color:#b91c1c'>Open assignments ({len(notes)})</h3>"
+            f"<ul style='color:#b91c1c'>{items}</ul>")
 
 
 def _trades(orders) -> str:
@@ -32,6 +65,13 @@ def _trades(orders) -> str:
     rows = []
     for o in orders:
         pnl = "" if o.get("pnl") is None else f"${o['pnl']:,.0f}"
+        if str(o.get("label", "")).startswith("SAFETY"):     # an assignment-unwind order
+            what = f"{o.get('action', '')} {o.get('qty', 0):g}"
+            px = "" if o.get("price") is None else f" @ {o['price']:.2f}"
+            rows.append(f"<tr><td>{what}</td><td>{o.get('ticker', '')}</td>"
+                        f"<td>{o['key']}</td><td>{o['label']}</td>"
+                        f"<td>{o.get('status', '')}{px}</td></tr>")
+            continue
         rows.append(f"<tr><td>{o['action']}</td><td>{o.get('ticker','')}</td>"
                     f"<td>{o['key']}</td><td>{o.get('reason','')}</td>"
                     f"<td>{o.get('status','')} {pnl}</td></tr>")
@@ -104,9 +144,13 @@ def _close_tally(trade_log) -> str:
 
 
 def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=False,
-                alerts=None) -> None:
-    unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
-                 for sp in state.open_spreads if sp.key in values)
+                alerts=None, unreal=None, marks=None) -> None:
+    # `unreal` is the runner's book_unrealized(): the SAME number the circuit breaker and the NAV
+    # snapshot use, assigned spreads included. The fallback (intact spreads only) is for callers
+    # that do not pass it.
+    if unreal is None:
+        unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
+                     for sp in state.open_spreads if sp.key in values)
     total = state.realized_pnl + unreal
     gate = "OPEN (contango)" if gate_open else "SHUT (backwardation)"
     label = os.getenv("BOOK_LABEL", "paper")           # "LIVE" in the live .env; "paper" otherwise
@@ -121,12 +165,14 @@ def send_report(state, values, orders, regime_ratio, gate_open, today, dry_run=F
     <p>Closes since inception (why) — <b>{_close_tally(state.trade_log)}</b></p>
     {_stop_ab(state)}
     {_gate_ab(state)}
+    {_open_assignments(state, today)}
     <h3>Open spreads</h3><table border=1 cellpadding=4>
     <tr><th>ticker</th><th>expiry</th><th>spread</th><th>credit</th><th>mark</th><th>unreal P&L</th></tr>
-    {_rows(state.open_spreads, values)}</table>
+    {_rows(state.open_spreads, values, marks)}</table>
     <h3>Today's trades</h3><table border=1 cellpadding=4>
     <tr><th>action</th><th>ticker</th><th>spread</th><th>reason</th><th>status / P&L</th></tr>
     {_trades(orders)}</table>
+    {_code_line()}
     </body></html>"""
 
     user, pw, to = os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"), os.getenv("TO_EMAIL")
