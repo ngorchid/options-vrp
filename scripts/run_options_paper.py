@@ -133,7 +133,7 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
                               "(would open a short); retry next run", sp.key, held, sp.ticker, 100 * n)
                 continue
             f = broker.sell_stock(sp.ticker, 100 * n)
-            actions.append({**f, "key": sp.key})
+            actions.append({**f, "key": sp.key, "ticker": sp.ticker})
             if f.get("status") != "Filled" or f.get("price") is None:
                 logging.error("ASSIGNMENT UNWIND %s: share sale NOT filled (%s) — the long put stays "
                               "on as the shares' protection; retry next run", sp.key, f.get("status"))
@@ -146,7 +146,7 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
                           "write a naked put); review by hand", sp.key, long_held, sp.long_strike, n)
             continue
         f2 = broker.sell_put(sp.ticker, sp.expiry, sp.long_strike, n)
-        actions.append({**f2, "key": sp.key})
+        actions.append({**f2, "key": sp.key, "ticker": sp.ticker})
         if f2.get("status") != "Filled" or f2.get("price") is None:
             logging.error("ASSIGNMENT UNWIND %s: long put sale NOT filled (%s); retry next run",
                           sp.key, f2.get("status"))
@@ -959,7 +959,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
 
         # 3) mark, persist, email
         values = broker.spread_values(state.open_spreads)
-        unreal = book_unrealized(state, values, *broker.marks())
+        _marks = broker.marks()
+        unreal = book_unrealized(state, values, *_marks)
         state.record_snapshot(today, state.realized_pnl + unreal)
         state.save(STATE_FILE)
         # RECONCILE state against IB. Motivated by the 2026-08-07 phantom close: a pending
@@ -998,7 +999,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         if _note:
             logging.warning("heartbeat: %s", _note)
         send_report(state, values, orders, res.regime_ratio, res.regime_open, today,
-                    alerts=ALERTS)
+                    alerts=ALERTS, unreal=unreal, marks=_marks)
         push_if_alerts(ALERTS, "Options VRP")
     except Exception:
         # A crash never reaches send_report: email what was collected (an assignment alert

@@ -65,7 +65,7 @@ MUTATIONS = [
      '        _unreal = 0.0',
      'circuit breaker blind to the book again'),
     ('scripts/run_options_paper.py',
-     '        unreal = book_unrealized(state, values, *broker.marks())\n        state.record_snapshot',
+     '        unreal = book_unrealized(state, values, *_marks)\n        state.record_snapshot',
      '        unreal = 0.0\n        state.record_snapshot',
      'NAV snapshot blind to the book again'),
     ('scripts/run_options_paper.py',

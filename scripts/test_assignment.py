@@ -119,7 +119,7 @@ src = inspect.getsource(runner.run_live)
 check("the circuit breaker's drawdown uses book_unrealized",
       "_unreal = book_unrealized(state, values, *broker.marks())" in src, "")
 check("the daily NAV snapshot uses book_unrealized",
-      "unreal = book_unrealized(state, values, *broker.marks())\n        state.record_snapshot" in src, "")
+      "unreal = book_unrealized(state, values, *_marks)\n        state.record_snapshot" in src, "")
 
 # =============================================================================================
 print("\nUNWIND — sell the shares FIRST, then the paired long puts; SAFETY, never blocked")
