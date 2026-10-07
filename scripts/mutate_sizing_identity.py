@@ -40,6 +40,18 @@ MUTATIONS = [
      '    "options-vrp": Allocation(1.00,',
      '    "options-vrp": Allocation(0.50,',
      'options-vrp ceiling lowered below its budget'),
+    ('scripts/test_sizing_identity.py',
+     'def same(a: str, b: str, rel: float = 1e-9) -> bool:',
+     'def same(a: str, b: str, rel: float = 1e-3) -> bool:',
+     'tolerance loosened to 1e-3 (would hide real changes)'),
+    ('scripts/test_sizing_identity.py',
+     '        if isinstance(x, str) and isinstance(y, str) and x[:1] in "{[" and y[:1] in "{[":',
+     '        if False:',
+     'nested JSON (trend targets) compared as raw text'),
+    ('scripts/test_sizing_identity.py',
+     '            return abs(x - y) <= rel * max(1.0, abs(x), abs(y))',
+     '            return True',
+     'floats never compared'),
 ]
 
 if __name__ == "__main__":
