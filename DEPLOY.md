@@ -84,3 +84,67 @@ schtasks /Create /TN "OptionsVRPPaper" ^
   on a $100k book — they'll simply be skipped that day. Expected behaviour with the current sizing.
 - Start conservative (the defaults already are: ≤3% risk/position, ≤6 positions). Widen only once
   the live shakeout and a few weeks of forward runs look clean.
+
+## Early assignment — what the runner does, and the manual unwind
+
+**Automatic (since 2026-10-07, `options_vrp/assignment.py`).** At each live run, before
+management, the runner looks for the fingerprint of an assignment: the short leg's quantity at IB
+dropped by *n* contracts **and** the account holds exactly 100 × *n* more shares at an average cost
+equal to the short strike. On an exact match it alerts (ERROR, in the email) and unwinds at once,
+flagged `SAFETY: assignment unwind` — no automated guard (margin ceiling, circuit breaker,
+`HALT_NEW`, cost guard) applies:
+
+1. SELL the delivered shares (100 × *n*). If that does not fill, it stops: the long put stays on as
+   the shares' protection and the next run retries.
+2. Only then SELL the *n* long puts that paired the assigned contracts. Any remaining contracts stay
+   a normal spread.
+
+The assigned position is valued in the circuit breaker and the NAV snapshot until it is gone.
+**`HALT_ALL` still stops everything**, the unwind included: it is the manual kill switch.
+
+**When it does NOT unwind automatically** — the alert says "MANUAL unwind needed":
+
+- the stock position is larger than the delivery or priced differently (magic-formula also holds
+  the name), so the runner cannot prove which shares are the sleeve's;
+- the short leg is gone but no stock is visible (closed by hand, or the delivery not yet shown);
+- `HALT_ALL` is set.
+
+### Manual unwind (same US session if at all possible)
+
+1. **Confirm** in TWS: the short put is gone (or reduced), the long put is still held, and the stock
+   position shows 100 × *n* shares at the short strike as average cost. If magic-formula holds the
+   same name, the delivered shares are the extra 100 × *n*.
+2. **Sell the delivered shares first** — exactly 100 × *n*, never more (anything beyond is
+   magic-formula's). Market or a marketable limit; this removes the large exposure.
+3. **Then deal with the *n* long puts:**
+   - normally: **sell** them;
+   - only if a put is deep in the money and its bid sits below intrinsic (strike − stock price):
+     **exercise** it instead, in TWS (Option Exercise) — the shares are then sold at the long
+     strike, settling the next day. Do this *instead of* step 2, not after it.
+4. Leave any contracts that were **not** assigned alone: they are still a paired spread.
+5. **Nothing to edit in `state.json`.** At its next run the sleeve sees the long puts gone and
+   retires the spread (`ASSIGNED_CLOSED_OUTSIDE`); the outside P&L is not booked by the sleeve —
+   IB's statement is the record. The next morning's two-way check flags the hand-placed orders as
+   untagged; that alert is expected and confirms them.
+
+### What one assignment does to the account (check it in IBKR before it happens)
+
+At this book's sizing an assignment delivers roughly **one to one-and-a-half times NAV in stock**:
+contracts are sized off max loss, so notional = contracts × 100 × strike is large. Rough examples
+at the live $50k budget (strikes approximate):
+
+| Spread | Contracts | Stock delivered |
+|---|---|---|
+| IWM 263/256 | 2 | ~$53k |
+| XLE ~88/86 | 8 | ~$70k |
+| BAC ~45/42.5 | 6 | ~$27k |
+| PFE ~24/23 | 17 | ~$41k |
+
+On a ~$50k account: long stock adds ~25% of its value to maintenance margin (≈ $13–18k for
+$53–70k), less the spread's own margin released (≈ $1.5k). That alone can take the excess-liquidity
+cushion from ~40% into the 10–20% band (`derisk` / `halt` levels), and **Reg-T initial margin (50%,
+≈ $26–35k) at the end of the day may produce a margin deficiency**, which IBKR can auto-liquidate.
+These are estimates. **Check the real number** in TWS before relying on it: create (do not
+transmit) a BUY of 200 IWM, use *Check Margin* / *What-If*, and read the change in maintenance
+margin and excess liquidity; repeat for 800 XLE. Assignment is likeliest exactly when the spread is
+deep in the money, i.e. already losing.

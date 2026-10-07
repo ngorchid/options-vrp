@@ -26,6 +26,13 @@ class OpenSpread:
     # WOULD have cut, and the realised P&L shows what they went on to do. With the stop ON
     # the counterfactual is unobservable, because the stop truncates the path.
     peak_value: float = 0.0
+    # EARLY ASSIGNMENT (2026-10-07; see options_vrp/assignment.py). Additive fields: older state
+    # files load with the defaults. assigned_contracts > 0 marks the spread ASSIGNED until the
+    # unwind completes; assigned_auto = the fingerprint matched exactly (automatic unwind allowed).
+    assigned_contracts: int = 0
+    assigned_date: str = ""
+    assigned_auto: bool = False
+    assigned_stock_sold: bool = False
 
     @property
     def key(self) -> str:

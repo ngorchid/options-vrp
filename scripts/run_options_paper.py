@@ -83,6 +83,98 @@ def backfill_exec_ids(state, today: str) -> int:
         return 0
 
 
+def handle_assignments(broker, state, today: str) -> list[dict]:
+    """EARLY ASSIGNMENT: detect, record, alert and unwind (see options_vrp/assignment.py).
+
+    SAFETY. Runs before management and consults NONE of the automated guards -- margin ceiling,
+    circuit breaker, HALT_NEW, cost guard, risk checks all leave it alone; the orders carry the
+    label "SAFETY: assignment unwind". Only the manual HALT_ALL kill switch stops it, because
+    HALT_ALL exits before connecting at all. Before every sale the position is re-read from IB,
+    so the unwind can never sell shares or puts the account does not hold (which would OPEN a
+    short stock position or a naked put)."""
+    from options_vrp import assignment as asg
+    actions: list[dict] = []
+    put_actual = broker.put_positions()
+    detail = broker.stock_positions_detail()
+    put_marks, stock_marks = broker.marks()
+    for a in asg.detect(state.open_spreads, put_actual, detail):
+        s = stock_marks.get(a.ticker)
+        exposure = f"${a.shares_expected * s:,.0f}" if s else "unknown"
+        logging.error("ASSIGNED %s: %s. Stock exposure ~%s. %s", a.key, a.note, exposure,
+                      "Unwinding now (SAFETY)." if a.exact else "MANUAL unwind needed — see DEPLOY.md.")
+        if a.stock_qty >= a.shares_expected:
+            asg.mark_assigned(state, a, today)
+    for sp in list(state.open_spreads):
+        n = int(getattr(sp, "assigned_contracts", 0) or 0)
+        if not n:
+            continue
+        long_key = (sp.ticker, sp.expiry.replace("-", ""), float(sp.long_strike))
+        long_held = float((put_actual or {}).get(long_key, 0.0)) if put_actual is not None else None
+        if long_held is not None and long_held <= 0:
+            # The long puts are gone at IB, yet the sleeve never sold them: the position was
+            # unwound by hand (DEPLOY.md) or the puts expired. Retire the spread so it stops
+            # alerting; what happened outside the sleeve is not reconstructable here.
+            state.open_spreads = [x for x in state.open_spreads if x.key != sp.key]
+            state.trade_log.append({"date": today, "action": "ASSIGNED_CLOSED_OUTSIDE", "key": sp.key,
+                                    "contracts": n, "note": "long puts no longer held at IB; P&L of "
+                                    "the outside unwind not booked — reconcile from IB's statement"})
+            logging.warning("ASSIGNED %s: long puts no longer held at IB — unwound outside the "
+                            "sleeve (or expired); retired from state, P&L not booked", sp.key)
+            continue
+        if not sp.assigned_auto:
+            logging.error("ASSIGNED %s (since %s) still needs a MANUAL unwind: %d contract(s), "
+                          "%d shares at %g — see DEPLOY.md", sp.key, sp.assigned_date, n,
+                          100 * n, sp.short_strike)
+            continue
+        if not sp.assigned_stock_sold:
+            held = (detail or {}).get(sp.ticker, (0.0, None))[0] if detail is not None else None
+            if held is None or held < 100 * n:
+                logging.error("ASSIGNMENT UNWIND %s: IB shows %s %s shares, need %d — NOT selling "
+                              "(would open a short); retry next run", sp.key, held, sp.ticker, 100 * n)
+                continue
+            f = broker.sell_stock(sp.ticker, 100 * n)
+            actions.append({**f, "key": sp.key})
+            if f.get("status") != "Filled" or f.get("price") is None:
+                logging.error("ASSIGNMENT UNWIND %s: share sale NOT filled (%s) — the long put stays "
+                              "on as the shares' protection; retry next run", sp.key, f.get("status"))
+                continue
+            pnl = asg.book_stock_sale(state, sp, f["price"], today, f)
+            logging.warning("ASSIGNMENT UNWIND %s: sold %d %s @ %.2f (stock leg P&L %+.0f)",
+                            sp.key, 100 * n, sp.ticker, f["price"], pnl)
+        if long_held is None or long_held < n:
+            logging.error("ASSIGNMENT UNWIND %s: IB shows %s long %gP, need %d — NOT selling (would "
+                          "write a naked put); review by hand", sp.key, long_held, sp.long_strike, n)
+            continue
+        f2 = broker.sell_put(sp.ticker, sp.expiry, sp.long_strike, n)
+        actions.append({**f2, "key": sp.key})
+        if f2.get("status") != "Filled" or f2.get("price") is None:
+            logging.error("ASSIGNMENT UNWIND %s: long put sale NOT filled (%s); retry next run",
+                          sp.key, f2.get("status"))
+            continue
+        pnl2 = asg.book_long_sale(state, sp, f2["price"], today, f2)
+        logging.warning("ASSIGNMENT UNWIND %s: sold %d long %gP @ %.2f (P&L %+.0f) — unwind complete",
+                        sp.key, n, sp.long_strike, f2["price"], pnl2)
+    return actions
+
+
+def book_unrealized(state, values: dict, put_marks: dict, stock_marks: dict) -> float:
+    """Unrealised P&L of the whole book for the circuit breaker and the NAV snapshot. Intact
+    spreads use their spread mark exactly as before; ASSIGNED ones are valued with the stock and
+    the long put (options_vrp/assignment.unrealized), so an assignment is never invisible."""
+    from options_vrp import assignment as asg
+    tot = 0.0
+    for sp in state.open_spreads:
+        if getattr(sp, "assigned_contracts", 0):
+            u = asg.unrealized(sp, put_marks, stock_marks)
+            if u is None:
+                logging.warning("cannot value ASSIGNED %s (missing mark) — left out this run", sp.key)
+            else:
+                tot += u
+        elif sp.key in values:
+            tot += (sp.entry_credit - values[sp.key]) * 100 * sp.contracts
+    return tot
+
+
 def book_open(state, sp, fill: dict, fallback_credit: float, today: str) -> bool:
     """Book an OPEN into the ledger with its link to IB's records. True if booked.
 
@@ -542,9 +634,14 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # to re-close a position that is not there. This is the self-heal for the combo-fill race.
         _resolve_pending(broker, state, today)
 
+        # 0b) EARLY ASSIGNMENT -- detect, alert and unwind (SAFETY: no automated guard applies).
+        orders.extend(handle_assignments(broker, state, today))
+
         # 1) MANAGE open spreads
         values = broker.spread_values(state.open_spreads)
         for sp in list(state.open_spreads):
+            if getattr(sp, "assigned_contracts", 0):
+                continue                                # ASSIGNED: handled by the unwind above
             cv = values.get(sp.key)
             if cv is None:
                 continue
@@ -561,8 +658,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # marks just fetched. Realised-only was blind to exactly the drawdowns that matter: a
         # short-put book can be deep underwater with nothing booked until it closes. Placed
         # before the OPEN loop so it can only ever block NEW risk.
-        _unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
-                      for sp in state.open_spreads if sp.key in values)
+        _unreal = book_unrealized(state, values, *broker.marks())
         # cfg.budget, NOT a re-read of the env: sizing now comes from the allocation table, and
         # a breaker measuring drawdown against a DIFFERENT base than the one being traded would
         # fire at the wrong level. Sizing and the breaker reading different numbers is
@@ -801,8 +897,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
 
         # 3) mark, persist, email
         values = broker.spread_values(state.open_spreads)
-        unreal = sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts
-                     for sp in state.open_spreads if sp.key in values)
+        unreal = book_unrealized(state, values, *broker.marks())
         state.record_snapshot(today, state.realized_pnl + unreal)
         state.save(STATE_FILE)
         # RECONCILE state against IB. Motivated by the 2026-08-07 phantom close: a pending
@@ -824,7 +919,10 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
             exp: dict[tuple, float] = {}
             for sp in state.open_spreads:
                 e = _ib_expiry(sp.expiry)
-                exp[(sp.ticker, e, float(sp.short_strike))] = -float(sp.contracts)
+                # An ASSIGNED short leg is expected to be gone (it is not a phantom); the long leg
+                # stays until the unwind sells it.
+                _n_a = int(getattr(sp, "assigned_contracts", 0) or 0)
+                exp[(sp.ticker, e, float(sp.short_strike))] = -float(sp.contracts - _n_a)
                 exp[(sp.ticker, e, float(sp.long_strike))] = float(sp.contracts)
             keyed_exp = {f"{k[0]} {k[1]} {k[2]:g}P": v for k, v in exp.items()}
             keyed_act = {f"{k[0]} {k[1]} {k[2]:g}P": v for k, v in actual.items()}
@@ -868,8 +966,8 @@ def main() -> None:
     code_version(ROOT)
     _halt, _hwhy = halt_state(ROOT)
     if _halt == HALT_ALL:
-        logging.error("HALTED (all): %s — exiting without trading. NOTE: profit targets and the "
-                      "21-DTE time stop did NOT run.", _hwhy)
+        logging.error("HALTED (all): %s — exiting without trading. NOTE: profit targets, the "
+                      "21-DTE time stop and the ASSIGNMENT unwind did NOT run.", _hwhy)
         push_if_alerts(ALERTS, "Options VRP")
         return
     if _halt == HALT_NEW:

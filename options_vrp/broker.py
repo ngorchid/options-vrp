@@ -239,6 +239,84 @@ class OptionsBroker:
             logging.warning("put_positions failed: %s", e)
             return None
 
+    def stock_positions_detail(self) -> dict[str, tuple[float, float | None]] | None:
+        """{symbol -> (signed shares, average cost per share)} for STOCK at IB, or None if
+        unavailable. The average cost is the assignment fingerprint: delivered shares carry the
+        short strike as their cost."""
+        if self.dry_run or self.ib is None:
+            return None
+        try:
+            qty: dict[str, float] = {}
+            cost: dict[str, float] = {}
+            for p in self.ib.positions():
+                c = p.contract
+                if c.secType == "STK" and p.position:
+                    qty[c.symbol] = qty.get(c.symbol, 0.0) + float(p.position)
+                    cost[c.symbol] = cost.get(c.symbol, 0.0) + float(p.position) * float(p.avgCost or 0.0)
+            return {s: (q, (cost[s] / q) if q else None) for s, q in qty.items()}
+        except Exception as e:  # noqa: BLE001
+            logging.warning("stock_positions_detail failed: %s", e)
+            return None
+
+    def marks(self) -> tuple[dict, dict]:
+        """({(symbol, yyyymmdd, strike): put mark}, {symbol: stock mark}) from IB's portfolio.
+        Empty dicts when unavailable -- callers treat a missing mark as "cannot value"."""
+        if self.dry_run or self.ib is None:
+            return {}, {}
+        puts: dict[tuple, float] = {}
+        stocks: dict[str, float] = {}
+        try:
+            for it in self.ib.portfolio():
+                c = it.contract
+                if c.secType == "OPT" and c.right == "P":
+                    puts[(c.symbol, c.lastTradeDateOrContractMonth, float(c.strike))] = float(it.marketPrice)
+                elif c.secType == "STK":
+                    stocks[c.symbol] = float(it.marketPrice)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("marks failed: %s", e)
+        return puts, stocks
+
+    def _single_order(self, contract, action: str, qty: float, label: str, wait: float = 45.0) -> dict:
+        """One MARKET order on one contract; same polling, tag and exec-id capture as the combos.
+        Used ONLY by the assignment unwind (label starts with 'SAFETY')."""
+        base = {"label": label, "action": action, "qty": qty}
+        if self.dry_run:
+            logging.info("[DRY RUN] %s %s %g %s", label, action, qty, getattr(contract, "symbol", ""))
+            return {**base, "status": "dryrun", "price": None, "exec_ids": [], "order_ref": ""}
+        from ib_insync import MarketOrder
+        q = self.ib.qualifyContracts(contract)
+        if not q:
+            logging.warning("%s: could not qualify %s", label, contract)
+            return {**base, "status": "qualify_failed", "price": None, "exec_ids": [], "order_ref": ""}
+        order = MarketOrder(action, qty)
+        order.tif = "DAY"
+        if getattr(self, "order_ref", None):            # a missing tag must never stop an order
+            order.orderRef = self.order_ref
+        trade = self.ib.placeOrder(q[0], order)
+        waited = 0.0
+        while waited < wait:
+            self.ib.sleep(1.0)
+            waited += 1.0
+            if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                break
+        st = trade.orderStatus.status
+        fp = trade.orderStatus.avgFillPrice or None
+        ex = self._exec_ids(trade) if st == "Filled" else []
+        logging.info("%s %s %g %s -> %s%s exec %s", label, action, qty, getattr(q[0], "symbol", ""),
+                     st, f" @ {fp}" if fp else "", ",".join(ex) or "-")
+        return {**base, "status": st, "price": float(fp) if fp else None, "exec_ids": ex,
+                "order_ref": getattr(order, "orderRef", "") or ""}
+
+    def sell_stock(self, ticker: str, shares: float, label: str = "SAFETY: assignment unwind") -> dict:
+        from ib_insync import Stock
+        return self._single_order(Stock(ticker, "SMART", "USD"), "SELL", shares, label)
+
+    def sell_put(self, ticker: str, expiry: str, strike: float, contracts: int,
+                 label: str = "SAFETY: assignment unwind") -> dict:
+        from ib_insync import Option
+        return self._single_order(Option(ticker, _ib_expiry(expiry), strike, "P", "SMART",
+                                         currency="USD"), "SELL", contracts, label)
+
     def spread_values(self, open_spreads: list[OpenSpread]) -> dict[str, float]:
         """{spread.key -> current per-share debit to close} = short_put_mark − long_put_mark.
         Empty for dry-run or legs not found in the portfolio."""
