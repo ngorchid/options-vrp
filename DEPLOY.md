@@ -87,6 +87,9 @@ schtasks /Create /TN "OptionsVRPPaper" ^
 
 ## Early assignment — what the runner does, and the manual unwind
 
+For an assignment on a name magic-formula also holds (the MANUAL, blended case), follow
+`docs/runbook_blended_assignment.md`.
+
 **Automatic (since 2026-10-07, `options_vrp/assignment.py`).** At each live run, before
 management, the runner looks for the fingerprint of an assignment: the short leg's quantity at IB
 dropped by *n* contracts **and** the account holds exactly 100 × *n* more shares at an average cost
