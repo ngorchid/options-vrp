@@ -88,6 +88,7 @@ class SimBroker:
                           ("XLE", E, 59.0): XS, ("XLE", E, 57.0): XL}
         self.stock_marks = {"IWM": S}
         self.calls: list[tuple] = []
+        self.orders: dict[int, dict] = {}         # permId -> what IB would report later
         self.dry_run = False
         self.ib = NS(sleep=lambda s: None)
 
@@ -129,6 +130,17 @@ class SimBroker:
                 out[sp.key] = self.put_marks[ks] - self.put_marks[kl]
         return out
 
+    def liquid_hours(self, symbol):
+        """Open all day today (00:00-23:59 New York time), so the market guard never blocks here."""
+        self.calls.append(("liquid_hours",))
+        import pandas as pd
+        d = pd.Timestamp.now(tz="America/New_York").strftime("%Y%m%d")
+        return (f"{d}:0000-{d}:2359", "US/Eastern")
+
+    def order_progress(self, perm):
+        self.calls.append(("order_progress", perm))
+        return self.orders.get(perm)
+
     def order_fill(self, perm):
         self.calls.append(("order_fill", perm))
         return None
@@ -136,15 +148,29 @@ class SimBroker:
     # orders
     def sell_stock(self, ticker, shares, label="SAFETY: assignment unwind"):
         self.calls.append(("sell_stock", ticker, shares))
-        base = {"label": label, "action": "SELL", "qty": shares, "order_ref": "options-vrp:T"}
+        perm = 100 + len(self.orders)
+        base = {"label": label, "action": "SELL", "qty": shares, "order_ref": "options-vrp:T",
+                "permId": perm}
         q, avg = self.stocks[ticker]
         if self.stock_fill == "full":
             self.stocks[ticker] = (q - shares, avg)
+            self.orders[perm] = {"status": "Filled", "filled": shares, "avg_price": S_FILL,
+                                 "exec_ids": ["stk1"]}
             return {**base, "status": "Filled", "price": S_FILL, "exec_ids": ["stk1"]}
         if self.stock_fill == "partial":
             self.stocks[ticker] = (q - 120, avg)          # 120 filled, the rest still working
+            self.orders[perm] = {"status": "Submitted", "filled": 120.0, "avg_price": S_FILL,
+                                 "exec_ids": ["stkA"]}
             return {**base, "status": "Submitted", "price": S_FILL, "exec_ids": []}
+        self.orders[perm] = {"status": "Cancelled", "filled": 0.0, "avg_price": None, "exec_ids": []}
         return {**base, "status": "Cancelled", "price": None, "exec_ids": []}
+
+    def complete(self, perm, ticker, shares):
+        """The working order fills the rest (e.g. at the next open)."""
+        o = self.orders[perm]
+        q, avg = self.stocks[ticker]
+        self.stocks[ticker] = (q - (shares - o["filled"]), avg)
+        self.orders[perm] = {**o, "status": "Filled", "filled": shares, "exec_ids": ["stkA", "stkB"]}
 
     def sell_put(self, ticker, expiry, strike, contracts, label="SAFETY: assignment unwind"):
         self.calls.append(("sell_put", ticker, strike, contracts))
@@ -245,7 +271,8 @@ def alerts(needle):
 X_CLOSE_PNL = (XC - X_FILL) * 100 * 8
 HEAD = [("connect",), ("margin_cushion",), ("put_positions",), ("stock_positions_detail",),
         ("marks",)]
-TAIL = [("marks",), ("spread_values",), ("marks",), ("put_positions",), ("disconnect",)]
+TAIL = [("marks",), ("liquid_hours",), ("spread_values",), ("marks",), ("put_positions",),
+        ("disconnect",)]
 
 # =============================================================================================
 print("FULL ASSIGNMENT — IWM 263/256 x2 assigned (200 sh @ 263); XLE intact and at its profit target")
@@ -303,21 +330,42 @@ st = live_pass(OptionsState(open_spreads=[iwm()]), fb, "pfill")
 want = HEAD + [("sell_stock", "IWM", 200), ("spread_values",)] + TAIL
 check("ordered calls: SELL 200 IWM only — the long puts are NOT sold while shares remain",
       fb.calls == want, f"\n      got  {fb.calls}\n      want {want}")
-check("PROPOSAL: the 120 shares that DID fill are booked nowhere (only a 'Filled' sale is booked)",
+check("run 1: nothing is booked yet (only a 'Filled' sale is booked in the run that places it)",
       st.realized_pnl == 0.0 and not any(t["action"] == "ASSIGNED_STOCK_SOLD" for t in st.trade_log),
       str(st.trade_log))
-held_val = (C + S - KS + PL) * 200
-check("PROPOSAL: ...so the breaker and snapshot still value 200 shares while IB holds 80",
-      abs(breaker_unreal(st) - held_val) < 1e-6 and abs(snapshot(st) - held_val) < 1e-6,
-      str((breaker_unreal(st), held_val)))
-check("alert: 'share sale NOT filled (Submitted)'", alerts("share sale NOT filled (Submitted)") != [],
+check("run 1: the order is TRACKED (decision #15): permId, 200 shares, 200 held when placed",
+      st.open_spreads and st.open_spreads[0].unwind_order.get("permId") == 100
+      and st.open_spreads[0].unwind_order.get("qty") == 200
+      and st.open_spreads[0].unwind_order.get("held_before") == 200, str(st.open_spreads))
+check("alert: 'share sale NOT filled (Submitted) — the order is left WORKING at IB and tracked'",
+      alerts("share sale NOT filled (Submitted) — the order is left WORKING at IB and tracked") != [],
       str(runner.ALERTS.records))
 fb.calls = []
 st = live_pass(st, fb, "pfill", fresh=False)
-check("PROPOSAL: next run IB shows 80 < 200 -> refuses to sell (would open a short) — stuck until a "
-      "hand unwind, alerting every run", ("sell_stock", "IWM", 200) not in fb.calls
-      and alerts("NOT selling (would open a short)") != [] and alerts("ASSIGNED POSITION") != [],
-      str((fb.calls, runner.ALERTS.records)))
+want = HEAD + [("order_progress", 100), ("spread_values",)] + TAIL
+check("run 2 (order still working, 120 filled): asks IB about the order and places NOTHING new",
+      fb.calls == want, f"\n      got  {fb.calls}\n      want {want}")
+row = next((t for t in st.trade_log if t["action"] == "ASSIGNED_STOCK_SOLD"), {})
+check("run 2: the 120 filled shares are booked at IB's average fill, with the order's exec ids",
+      row.get("shares") == 120.0 and row.get("price") == S_FILL and row.get("exec_ids") == ["stkA"]
+      and "IB average fill" in row.get("note", "")
+      and abs(st.realized_pnl - (C + S_FILL - KS) * 120) < 1e-6, str(row))
+left_val = (C + S - KS) * 80 + PL * 200
+check("run 2: breaker and snapshot value only the 80 shares still held (+ the long puts)",
+      abs(breaker_unreal(st) - left_val) < 1e-6
+      and abs(snapshot(st) - (st.realized_pnl + left_val)) < 1e-6, str((breaker_unreal(st), left_val)))
+check("run 2: alert 'still working at IB ... not re-placed'", alerts("still working at IB") != [],
+      str(runner.ALERTS.records))
+fb.complete(100, "IWM", 200)
+fb.calls = []
+st = live_pass(st, fb, "pfill", fresh=False)
+want = HEAD + [("order_progress", 100), ("sell_put", "IWM", KL, 2), ("spread_values",)] + TAIL
+check("run 3 (the order filled the rest): books the last 80 shares, then sells the 2 long puts",
+      fb.calls == want and st.open_spreads == [], f"\n      got  {fb.calls}\n      want {want}")
+sold = [t.get("shares") for t in st.trade_log if t["action"] == "ASSIGNED_STOCK_SOLD"]
+check("run 3: shares booked 120 + 80 = 200, never more; total P&L = the full unwind",
+      sold == [120.0, 80.0] and abs(st.realized_pnl - ((C + S_FILL - KS) * 200 + PL_FILL * 200)) < 1e-6,
+      str((sold, st.realized_pnl)))
 
 # =============================================================================================
 print("\nSHARE SALE DOES NOT FILL — then completes on the next run")
@@ -342,11 +390,31 @@ check("alert: 'share sale NOT filled (Cancelled)' and the escalating line",
       alerts("share sale NOT filled (Cancelled)") != [] and alerts("ASSIGNED POSITION OPEN") != [], "")
 fb.stock_fill, fb.calls = "full", []
 st = live_pass(st, fb, "nofill", fresh=False)
-want = HEAD + [("sell_stock", "IWM", 200), ("sell_put", "IWM", KL, 2), ("spread_values",)] + TAIL
-check("next run: SELL 200 IWM, SELL 2 IWM 256P — unwind complete, spread gone",
+want = HEAD + [("order_progress", 100), ("sell_stock", "IWM", 200), ("sell_put", "IWM", KL, 2),
+               ("spread_values",)] + TAIL
+check("next run: IB reports the tracked order Cancelled (0 filled) -> SELL 200 IWM again, SELL 2 "
+      "IWM 256P — unwind complete, spread gone",
       fb.calls == want and st.open_spreads == [], f"\n      got  {fb.calls}\n      want {want}")
 
 # =============================================================================================
+print("\nSUSPECTED (decision #17) — XLE: 1 of 8 short contracts gone, no shares, at its profit target")
+fb = SimBroker({("XLE", E, 59.0): -7.0, ("XLE", E, 57.0): 8.0}, {})
+st = live_pass(OptionsState(open_spreads=[xle()]), fb, "suspected")
+want = HEAD + [("spread_values",)] + TAIL
+check("ordered calls: NO combo close although the mark is at the profit target (a broken pair is "
+      "never managed)", fb.calls == want, f"\n      got  {fb.calls}\n      want {want}")
+check("recorded as SUSPECTED 1 of 8, not assigned", st.open_spreads and st.open_spreads[0].assign_suspected == 1
+      and not st.open_spreads[0].assigned_contracts, str(st.open_spreads))
+check("breaker and snapshot leave it out WITH a 'cannot value' warning",
+      abs(breaker_unreal(st)) < 1e-6 and abs(snapshot(st)) < 1e-6
+      and alerts("cannot value XLE") != [], str((breaker_unreal(st), runner.ALERTS.records)))
+check("reconcile expects the gone short contract (no daily false MISMATCH / PHANTOM for XLE)",
+      not [m for _, m in runner.ALERTS.records if "XLE" in m and ("MISMATCH" in m or "PHANTOM" in m)],
+      str(runner.ALERTS.records))
+subj, body = report()
+check("report: row 'SUSPECTED 1 of 8 (cannot value)' and the Open assignments block lists it",
+      "SUSPECTED 1 of 8 (cannot value)" in body and "ASSIGNMENT SUSPECTED OPEN" in body, body[:3000])
+
 print("\nNOTHING ASSIGNED — the block says so explicitly")
 fb = SimBroker({("IWM", E, KS): -2.0, ("IWM", E, KL): 2.0}, {})
 st = live_pass(OptionsState(open_spreads=[iwm()]), fb, "none")

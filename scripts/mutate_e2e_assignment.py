@@ -27,6 +27,12 @@ INTACT_ONLY = ("sum((sp.entry_credit - values[sp.key]) * 100 * sp.contracts "
                "for sp in state.open_spreads if sp.key in values)")
 
 MUTATIONS = [
+    (RUNNER, '            if getattr(sp, "assigned_contracts", 0) or getattr(sp, "assign_suspected", 0):\n                continue',
+     '            if getattr(sp, "assigned_contracts", 0):\n                continue',
+     '#17: the manage loop combo-closes a SUSPECTED (broken) pair'),
+    (RUNNER, '                        or int(getattr(sp, "assign_suspected", 0) or 0))',
+     '                        or 0)', '#17: the reconcile expects a suspected short leg (daily false alarm)'),
+    (REPORT, '        if n_s and not n_a:', '        if False:', '#17: the report shows a suspected spread as normal'),
     (RUNNER, _block, _late,
      'handle_assignments runs AFTER management instead of before'),
     (RUNNER, '        orders.extend(handle_assignments(broker, state, today))\n',

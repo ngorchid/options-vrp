@@ -217,6 +217,32 @@ class OptionsBroker:
     def close_spread(self, sp: OpenSpread, wait: float = 45.0) -> dict:
         return self._combo_order(sp, opening=False, wait=wait)
 
+    def order_progress(self, perm_id) -> dict | None:
+        """{status, filled, avg_price, exec_ids} of a previously-placed single-leg order (the
+        tracked assignment unwind, decision #15), or None if IB cannot show it. Never raises.
+        `filled` / `avg_price` may be missing for an order completed in an earlier session; the
+        caller then falls back to the position change."""
+        if self.dry_run or self.ib is None or not perm_id:
+            return None
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.reqCompletedOrders(False)
+            self.ib.sleep(1.0)
+            for t in self.ib.trades():
+                if int(getattr(t.order, "permId", 0) or 0) != int(perm_id):
+                    continue
+                os_ = t.orderStatus
+                fills = list(getattr(t, "fills", None) or [])
+                filled = getattr(os_, "filled", None)
+                fp = getattr(os_, "avgFillPrice", None)
+                return {"status": os_.status,
+                        "filled": float(filled) if filled not in (None, "") else None,
+                        "avg_price": abs(float(fp)) if fp else None,
+                        "exec_ids": [f.execution.execId for f in fills]}
+        except Exception as e:  # noqa: BLE001
+            logging.warning("order_progress(%s) failed: %s", perm_id, e)
+        return None
+
     def order_fill(self, perm_id) -> tuple[str, float] | None:
         """(status, avg_fill_price) for a previously-placed order by permId, or None.
 
@@ -237,6 +263,22 @@ class OptionsBroker:
         except Exception as e:  # noqa: BLE001
             logging.warning("order_fill(%s) failed: %s", perm_id, e)
         return None
+
+    def liquid_hours(self, symbol: str = "SPY") -> tuple[str, str] | None:
+        """(liquidHours, timeZoneId) from IB's contract details for a US stock, or None.
+        Used by the market-open guard (options_vrp/market_hours.py); never raises."""
+        if self.dry_run or self.ib is None:
+            return None
+        try:
+            from ib_insync import Stock
+            cds = self.ib.reqContractDetails(Stock(symbol, "SMART", "USD"))
+            if not cds:
+                return None
+            cd = cds[0]
+            return (getattr(cd, "liquidHours", "") or "", getattr(cd, "timeZoneId", "") or "")
+        except Exception as e:  # noqa: BLE001
+            logging.warning("liquid_hours(%s) failed: %s", symbol, e)
+            return None
 
     # --- marks (from portfolio feed; no market-data sub needed) ---
     def put_positions(self) -> dict[tuple, float] | None:
@@ -328,6 +370,7 @@ class OptionsBroker:
                      st, f" @ {fp}" if fp else "", ",".join(ex) or "-")
         return {**base, "status": st, "price": float(fp) if fp else None, "exec_ids": ex,
                 "order_ref": getattr(order, "orderRef", "") or "",
+                "permId": int(getattr(trade.order, "permId", 0) or 0),
                 "conids": [int(getattr(q[0], "conId", 0) or 0)],
                 "commission": self._commission(trade) if st == "Filled" else None,
                 "currency": getattr(q[0], "currency", "") or "USD"}

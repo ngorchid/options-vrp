@@ -97,6 +97,16 @@ def escalation_notes(open_spreads, today: str, level: str = "") -> list[str]:
     import numpy as np
     out = []
     for sp in open_spreads:
+        ns = int(getattr(sp, "assign_suspected", 0) or 0)
+        if ns and not getattr(sp, "assigned_contracts", 0):
+            since = getattr(sp, "assign_suspected_date", "") or today
+            days = int(np.busday_count(since, today)) + 1 if since <= today else 1
+            sev = "URGENT" if days >= 3 else ("ESCALATION" if days == 2 else "OPEN")
+            out.append(f"ASSIGNMENT SUSPECTED {sev} — day {days} since {since}: {sp.key}, {ns} "
+                       f"contract(s): short {sp.short_strike:g}P gone but the {MULT * ns} "
+                       f"{sp.ticker} shares are not (all) visible; not managed, not valued"
+                       + (f" under {level}" if level else "") + "; manual review (DEPLOY.md)")
+            continue
         n = int(getattr(sp, "assigned_contracts", 0) or 0)
         if not n:
             continue
@@ -107,16 +117,36 @@ def escalation_notes(open_spreads, today: str, level: str = "") -> list[str]:
                 if level == "HALT_HARD" else
                 "the automatic unwind retries each run" if getattr(sp, "assigned_auto", False)
                 else "needs a MANUAL unwind (DEPLOY.md)")
+        sold = float(getattr(sp, "assigned_shares_sold", 0.0) or 0.0)
+        shares = ("shares sold, " if getattr(sp, "assigned_stock_sold", False) else
+                  f"{MULT * n - sold:g} of {MULT * n} {sp.ticker} shares + " if sold else
+                  f"{MULT * n} {sp.ticker} shares + ")
+        order = getattr(sp, "unwind_order", None) or {}
+        working = (f"; unwind order working at IB (permId {order.get('permId')})" if order else "")
         out.append(f"ASSIGNED POSITION {sev} — day {days} since {since}: {sp.key}, {n} contract(s): "
-                   f"{'shares sold, ' if getattr(sp, 'assigned_stock_sold', False) else f'{MULT * n} {sp.ticker} shares + '}"
-                   f"{n} long {sp.long_strike:g}P still open"
-                   + (f" under {level}" if level else "") + f"; {will}")
+                   f"{shares}{n} long {sp.long_strike:g}P still open"
+                   + (f" under {level}" if level else "") + f"{working}; {will}")
     return out
+
+
+def mark_suspected(state, a: Assignment, today: str) -> bool:
+    """Record a SUSPECTED assignment: short leg gone, shares not (all) visible. Returns True when
+    newly suspected (one ASSIGNMENT_SUSPECTED ledger row; later runs only escalate)."""
+    sp = next(s for s in state.open_spreads if s.key == a.key)
+    new = not getattr(sp, "assign_suspected", 0)
+    sp.assign_suspected = a.assigned
+    if new:
+        sp.assign_suspected_date = today
+        state.trade_log.append({"date": today, "action": "ASSIGNMENT_SUSPECTED", "key": a.key,
+                                "contracts": a.assigned, "shares_seen": a.stock_qty,
+                                "shares_expected": a.shares_expected, "note": a.note})
+    return new
 
 
 def mark_assigned(state, a: Assignment, today: str) -> None:
     """Record the assignment on the spread and in the trade log (bookkeeping only)."""
     sp = next(s for s in state.open_spreads if s.key == a.key)
+    sp.assign_suspected, sp.assign_suspected_date = 0, ""      # a suspicion is now confirmed
     sp.assigned_contracts = a.assigned
     sp.assigned_date = today
     sp.assigned_auto = a.exact
@@ -126,7 +156,8 @@ def mark_assigned(state, a: Assignment, today: str) -> None:
 
 
 def unrealized(sp, put_marks: dict, stock_marks: dict, mult: int = MULT) -> float | None:
-    """Unrealised P&L of one spread, assigned or not (see module docstring). None if unmarkable."""
+    """Unrealised P&L of one spread, assigned or not (see module docstring). None if unmarkable.
+    Shares already sold by the unwind (assigned_shares_sold) are realised, not valued again."""
     e = _ib_exp(sp.expiry)
     pl = put_marks.get((sp.ticker, e, float(sp.long_strike)))
     if pl is None:
@@ -146,46 +177,59 @@ def unrealized(sp, put_marks: dict, stock_marks: dict, mult: int = MULT) -> floa
             s = stock_marks.get(sp.ticker)
             if s is None:
                 return None
-            total += (sp.entry_credit + (s - sp.short_strike) + pl) * n_a
+            left = mult * n_a - float(getattr(sp, "assigned_shares_sold", 0.0) or 0.0)
+            total += (sp.entry_credit + (s - sp.short_strike)) * left / mult + pl * n_a
     return total * mult
 
 
-def book_stock_sale(state, sp, price: float, today: str, fill: dict, mult: int = MULT) -> float:
-    """Realise the assigned contracts' stock leg: c + (S_sale - Ks) per share. Returns P&L."""
+def _row(fill: dict) -> dict:
+    return {"order_ref": fill.get("order_ref", ""), "exec_ids": list(fill.get("exec_ids") or []),
+            "conids": list(fill.get("conids") or []), "commission": fill.get("commission"),
+            "currency": fill.get("currency") or ""}
+
+
+def book_stock_sale(state, sp, price: float, today: str, fill: dict, mult: int = MULT,
+                    shares: float | None = None, note: str = "") -> float:
+    """Realise delivered shares sold by the unwind: (c + S_sale - Ks) per share. `shares` defaults
+    to all still held; a partial fill books only what filled. Returns P&L."""
     n = sp.assigned_contracts
-    pnl = (sp.entry_credit + (price - sp.short_strike)) * mult * n
+    left = mult * n - float(getattr(sp, "assigned_shares_sold", 0.0) or 0.0)
+    q = left if shares is None else min(float(shares), left)
+    pnl = (sp.entry_credit + (price - sp.short_strike)) * q
     state.realized_pnl += pnl
-    sp.assigned_stock_sold = True
+    sp.assigned_shares_sold = float(getattr(sp, "assigned_shares_sold", 0.0) or 0.0) + q
+    if sp.assigned_shares_sold >= mult * n - 1e-9:
+        sp.assigned_stock_sold = True
     state.trade_log.append({"date": today, "action": "ASSIGNED_STOCK_SOLD", "key": sp.key,
-                            "contracts": n, "shares": mult * n, "price": price, "pnl": pnl,
-                            "reason": "SAFETY: assignment unwind",
-                            "order_ref": fill.get("order_ref", ""),
-                            "exec_ids": list(fill.get("exec_ids") or []),
-                            "conids": list(fill.get("conids") or []),
-                            "commission": fill.get("commission"),
-                            "currency": fill.get("currency") or ""})
+                            "contracts": n, "shares": q, "price": price, "pnl": pnl,
+                            "reason": "SAFETY: assignment unwind", **_row(fill),
+                            **({"note": note} if note else {})})
     return pnl
 
 
-def book_long_sale(state, sp, price: float, today: str, fill: dict, mult: int = MULT) -> float:
-    """Realise the assigned contracts' long puts and shrink (or remove) the spread. Returns P&L."""
+def book_long_sale(state, sp, price: float, today: str, fill: dict, mult: int = MULT,
+                   contracts: int | None = None, note: str = "") -> float:
+    """Realise k of the assigned contracts' long puts (default: all of them) and shrink (or remove)
+    the spread. Returns P&L."""
     n = sp.assigned_contracts
-    pnl = price * mult * n
+    k = n if contracts is None else max(0, min(int(contracts), n))
+    pnl = price * mult * k
     state.realized_pnl += pnl
     state.trade_log.append({"date": today, "action": "ASSIGNED_LONG_SOLD", "key": sp.key,
-                            "contracts": n, "strike": sp.long_strike, "price": price, "pnl": pnl,
-                            "reason": "SAFETY: assignment unwind",
-                            "order_ref": fill.get("order_ref", ""),
-                            "exec_ids": list(fill.get("exec_ids") or []),
-                            "conids": list(fill.get("conids") or []),
-                            "commission": fill.get("commission"),
-                            "currency": fill.get("currency") or ""})
-    remaining = sp.contracts - n
+                            "contracts": k, "strike": sp.long_strike, "price": price, "pnl": pnl,
+                            "reason": "SAFETY: assignment unwind", **_row(fill),
+                            **({"note": note} if note else {})})
+    remaining = sp.contracts - k
     if remaining <= 0:
         state.open_spreads = [s for s in state.open_spreads if s.key != sp.key]
-    else:
-        sp.contracts = remaining                   # the rest is a normal, still-paired spread
+        return pnl
+    sp.contracts = remaining
+    sp.assigned_contracts = n - k
+    sp.assigned_shares_sold = max(0.0, float(getattr(sp, "assigned_shares_sold", 0.0) or 0.0) - mult * k)
+    if sp.assigned_contracts <= 0:                 # the rest is a normal, still-paired spread
         sp.assigned_contracts = 0
         sp.assigned_stock_sold = False
         sp.assigned_auto = False
+        sp.assigned_shares_sold = 0.0
+        sp.unwind_order = {}
     return pnl

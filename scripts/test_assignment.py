@@ -145,6 +145,11 @@ class FakeBroker:
         return {"status": st, "price": price if st == "Filled" else None, "label": what[3],
                 "exec_ids": [f"x{len(self.calls)}"], "order_ref": "options-vrp:R"}
 
+    def order_progress(self, perm_id):
+        """A tracked order from the previous run: by default it ended unfilled (cancelled at the
+        close), so the unwind places a fresh one. test_unwind_tracking.py covers the rest."""
+        return {"status": "Cancelled", "filled": 0.0, "avg_price": None, "exec_ids": []}
+
     def sell_stock(self, ticker, shares, label="SAFETY: assignment unwind"):
         return self._fill(("STK", ticker, shares, label), 255.0)
 
@@ -207,7 +212,7 @@ check("share sale NOT filled -> the long put is NOT sold (it protects the shares
       and not st.open_spreads[0].assigned_stock_sold, str(fb.calls))
 fb2 = FakeBroker({S: 0.0, L: 2.0}, {"IWM": (200.0, 263.0)})
 safe(runner.handle_assignments, fb2, st, "2026-10-09")
-check("...retried on the next run and completed", [c[0] for c in fb2.calls] == ["STK", "PUT"]
+check("...the order ended unfilled (cancelled): retried on the next run and completed", [c[0] for c in fb2.calls] == ["STK", "PUT"]
       and st.open_spreads == [], str(fb2.calls))
 
 st = OptionsState(open_spreads=[sp()])
@@ -218,7 +223,7 @@ check("shares sold but the long-put sale NOT filled: stock leg booked, spread ke
       and [r["action"] for r in st.trade_log] == ["ASSIGNED", "ASSIGNED_STOCK_SOLD"], str(st.trade_log))
 fb2 = FakeBroker({S: 0.0, L: 2.0}, {"IWM": (0.0, None)})
 safe(runner.handle_assignments, fb2, st, "2026-10-09")
-check("...next run sells ONLY the long puts (the shares are already gone) and completes",
+check("...the put order ended unfilled: next run sells ONLY the long puts and completes",
       [c[0] for c in fb2.calls] == ["PUT"] and st.open_spreads == [], str(fb2.calls))
 
 st = OptionsState(open_spreads=[sp(assigned_contracts=2, assigned_auto=True)])
@@ -268,7 +273,7 @@ _h, _m = src.find("handle_assignments(broker, state, today)"), src.find("# 1) MA
 check("run_live runs it BEFORE management and the guards' effects (opens only) do not reach it",
       0 <= _h < _m, f"{_h} {_m}")
 check("the manage loop skips ASSIGNED spreads (no combo close on a broken pair)",
-      "if getattr(sp, \"assigned_contracts\", 0):\n                continue" in src, "")
+      "if getattr(sp, \"assigned_contracts\", 0) or getattr(sp, \"assign_suspected\", 0):\n                continue" in src, "")
 check("the reconcile expects an assigned short leg to be gone (no daily false PHANTOM)",
       "exp[(sp.ticker, e, float(sp.short_strike))] = -float(sp.contracts - _n_a)" in src, "")
 runner.logging.error, runner.logging.warning = _orig

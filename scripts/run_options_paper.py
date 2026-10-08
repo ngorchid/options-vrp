@@ -97,17 +97,63 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
     put_actual = broker.put_positions()
     detail = broker.stock_positions_detail()
     put_marks, stock_marks = broker.marks()
-    for a in asg.detect(state.open_spreads, put_actual, detail):
+    found = asg.detect(state.open_spreads, put_actual, detail)
+    for a in found:
         s = stock_marks.get(a.ticker)
         exposure = f"${a.shares_expected * s:,.0f}" if s else "unknown"
-        logging.error("ASSIGNED %s: %s. Stock exposure ~%s. %s", a.key, a.note, exposure,
-                      "Unwinding now (SAFETY)." if a.exact else "MANUAL unwind needed — see DEPLOY.md.")
         if a.stock_qty >= a.shares_expected:
+            logging.error("ASSIGNED %s: %s. Stock exposure ~%s. %s", a.key, a.note, exposure,
+                          "Unwinding now (SAFETY)." if a.exact else "MANUAL unwind needed — see DEPLOY.md.")
             asg.mark_assigned(state, a, today)
+        else:
+            # Decision #17: never silently. Recorded as SUSPECTED -- out of management, warned as
+            # "cannot value" by book_unrealized, escalated daily -- until it resolves.
+            new = asg.mark_suspected(state, a, today)
+            logging.error("ASSIGNMENT SUSPECTED %s: %s.%s", a.key, a.note,
+                          " Recorded; kept out of management until the shares appear or the short "
+                          "leg is back." if new else "")
+    if put_actual is not None and detail is not None:
+        _hit = {a.key for a in found}
+        for sp in list(state.open_spreads):
+            if not getattr(sp, "assign_suspected", 0) or sp.key in _hit:
+                continue
+            # Positions were read and nothing is missing any more: the short leg is back.
+            logging.warning("ASSIGNMENT SUSPECTED %s: cleared — the short leg is held again at IB",
+                            sp.key)
+            state.trade_log.append({"date": today, "action": "ASSIGNMENT_SUSPECTED_CLEARED",
+                                    "key": sp.key, "contracts": sp.assign_suspected})
+            sp.assign_suspected, sp.assign_suspected_date = 0, ""
+    for sp in list(state.open_spreads):
+        if not getattr(sp, "assign_suspected", 0) or getattr(sp, "assigned_contracts", 0):
+            continue
+        lk = (sp.ticker, sp.expiry.replace("-", ""), float(sp.long_strike))
+        if put_actual is not None and float(put_actual.get(lk, 0.0)) <= 0:
+            # Short AND long legs gone without the sleeve trading them: closed by hand. Retired so
+            # it stops alerting; the P&L is booked with scripts/book_hand_unwind.py.
+            state.open_spreads = [x for x in state.open_spreads if x.key != sp.key]
+            state.trade_log.append({"date": today, "action": "CLOSED_OUTSIDE", "key": sp.key,
+                                    "contracts": sp.contracts, "note": "suspected assignment: "
+                                    "short and long legs no longer held at IB; P&L not booked — "
+                                    "book it with scripts/book_hand_unwind.py"})
+            logging.warning("ASSIGNMENT SUSPECTED %s: both legs gone at IB — closed outside the "
+                            "sleeve; retired, P&L not booked (scripts/book_hand_unwind.py)", sp.key)
     for sp in list(state.open_spreads):
         n = int(getattr(sp, "assigned_contracts", 0) or 0)
         if not n:
             continue
+        if getattr(sp, "unwind_order", None):
+            # Decision #15: an earlier SAFETY sale is still tracked. Book what filled FIRST -- before
+            # the "long puts gone at IB" check below, which would otherwise read the sleeve's own
+            # filled put sale as a hand unwind -- and never place a second order while the first
+            # may still be working (two orders could sell twice).
+            if not _resolve_unwind_order(broker, state, sp, detail, put_actual, put_marks,
+                                         stock_marks, today):
+                continue
+            if not state.has(sp.key):
+                continue                                # the tracked put sale completed the unwind
+            n = int(getattr(sp, "assigned_contracts", 0) or 0)
+            if not n:
+                continue
         long_key = (sp.ticker, sp.expiry.replace("-", ""), float(sp.long_strike))
         long_held = float((put_actual or {}).get(long_key, 0.0)) if put_actual is not None else None
         if long_held is not None and long_held <= 0:
@@ -127,20 +173,23 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
                           100 * n, sp.short_strike)
             continue
         if not sp.assigned_stock_sold:
+            need = 100 * n - float(getattr(sp, "assigned_shares_sold", 0.0) or 0.0)
             held = (detail or {}).get(sp.ticker, (0.0, None))[0] if detail is not None else None
-            if held is None or held < 100 * n:
-                logging.error("ASSIGNMENT UNWIND %s: IB shows %s %s shares, need %d — NOT selling "
-                              "(would open a short); retry next run", sp.key, held, sp.ticker, 100 * n)
+            if held is None or held < need - 1e-9:
+                logging.error("ASSIGNMENT UNWIND %s: IB shows %s %s shares, need %g — NOT selling "
+                              "(would open a short); retry next run", sp.key, held, sp.ticker, need)
                 continue
-            f = broker.sell_stock(sp.ticker, 100 * n)
+            f = broker.sell_stock(sp.ticker, need)
             actions.append({**f, "key": sp.key, "ticker": sp.ticker})
             if f.get("status") != "Filled" or f.get("price") is None:
-                logging.error("ASSIGNMENT UNWIND %s: share sale NOT filled (%s) — the long put stays "
-                              "on as the shares' protection; retry next run", sp.key, f.get("status"))
+                _track_unwind_order(sp, "stock", f, need, held, today)
+                logging.error("ASSIGNMENT UNWIND %s: share sale NOT filled (%s) — the order is left "
+                              "WORKING at IB and tracked; any fill is booked on the next run. The "
+                              "long put stays on as the shares' protection", sp.key, f.get("status"))
                 continue
-            pnl = asg.book_stock_sale(state, sp, f["price"], today, f)
-            logging.warning("ASSIGNMENT UNWIND %s: sold %d %s @ %.2f (stock leg P&L %+.0f)",
-                            sp.key, 100 * n, sp.ticker, f["price"], pnl)
+            pnl = asg.book_stock_sale(state, sp, f["price"], today, f, shares=need)
+            logging.warning("ASSIGNMENT UNWIND %s: sold %g %s @ %.2f (stock leg P&L %+.0f)",
+                            sp.key, need, sp.ticker, f["price"], pnl)
         if long_held is None or long_held < n:
             logging.error("ASSIGNMENT UNWIND %s: IB shows %s long %gP, need %d — NOT selling (would "
                           "write a naked put); review by hand", sp.key, long_held, sp.long_strike, n)
@@ -148,13 +197,98 @@ def handle_assignments(broker, state, today: str) -> list[dict]:
         f2 = broker.sell_put(sp.ticker, sp.expiry, sp.long_strike, n)
         actions.append({**f2, "key": sp.key, "ticker": sp.ticker})
         if f2.get("status") != "Filled" or f2.get("price") is None:
-            logging.error("ASSIGNMENT UNWIND %s: long put sale NOT filled (%s); retry next run",
+            _track_unwind_order(sp, "put", f2, n, long_held, today)
+            logging.error("ASSIGNMENT UNWIND %s: long put sale NOT filled (%s) — the order is left "
+                          "WORKING at IB and tracked; any fill is booked on the next run",
                           sp.key, f2.get("status"))
             continue
         pnl2 = asg.book_long_sale(state, sp, f2["price"], today, f2)
         logging.warning("ASSIGNMENT UNWIND %s: sold %d long %gP @ %.2f (P&L %+.0f) — unwind complete",
                         sp.key, n, sp.long_strike, f2["price"], pnl2)
     return actions
+
+
+_LIVE_STATUSES = ("Submitted", "PreSubmitted", "PendingSubmit", "ApiPending", "PendingCancel")
+
+
+def _track_unwind_order(sp, leg: str, fill: dict, qty: float, held_before: float, today: str) -> None:
+    """Remember an unfilled SAFETY sale so the next run can book its fills (decision #15)."""
+    sp.unwind_order = {"leg": leg, "permId": int(fill.get("permId") or 0), "qty": float(qty),
+                       "held_before": float(held_before), "placed": today, "booked": 0.0,
+                       "status": fill.get("status"), "order_ref": fill.get("order_ref", "")}
+
+
+def _resolve_unwind_order(broker, state, sp, detail, put_actual, put_marks, stock_marks,
+                          today: str) -> bool:
+    """Book what a tracked unwind order filled since it was placed. Returns True when the order is
+    finished (fully booked, terminal, or certainly expired) and the unwind may continue; False
+    while it may still be working -- then nothing else is placed for this spread this run.
+
+    Filled quantity: IB's own count for the order, or the drop in the position since it was placed,
+    whichever is larger (a completed order from an earlier session may report no count). Price:
+    IB's average fill, else the current mark -- labelled as such in the ledger row."""
+    import numpy as np
+    from options_vrp import assignment as asg
+    pend = dict(sp.unwind_order)
+    leg, qty, booked = pend.get("leg"), float(pend.get("qty") or 0), float(pend.get("booked") or 0)
+    prog = broker.order_progress(pend.get("permId"))
+    if leg == "stock":
+        held_now = (detail.get(sp.ticker, (0.0, None))[0] if detail is not None else None)
+    else:
+        lk = (sp.ticker, sp.expiry.replace("-", ""), float(sp.long_strike))
+        held_now = float(put_actual.get(lk, 0.0)) if put_actual is not None else None
+    by_ib = float(prog["filled"]) if prog and prog.get("filled") is not None else 0.0
+    by_pos = (max(0.0, float(pend.get("held_before") or 0) - float(held_now))
+              if held_now is not None else 0.0)
+    filled = max(by_ib, by_pos, booked)          # the bookings below cap at what is still held
+    new = filled - booked
+    if new > 1e-9:
+        if prog and prog.get("avg_price"):
+            price, src = float(prog["avg_price"]), "IB average fill"
+        else:
+            price = (stock_marks.get(sp.ticker) if leg == "stock" else
+                     put_marks.get((sp.ticker, sp.expiry.replace("-", ""), float(sp.long_strike))))
+            src = "MARK (IB fill price not available)"
+        if price is None:
+            logging.error("ASSIGNMENT UNWIND %s: tracked %s order filled %g but no price is "
+                          "available to book it — kept for the next run", sp.key, leg, new)
+            return False
+        f = {"order_ref": pend.get("order_ref", ""), "exec_ids": (prog or {}).get("exec_ids") or []}
+        note = (f"tracked unwind order permId {pend.get('permId')} placed {pend.get('placed')}: "
+                f"{new:g} filled after the run that placed it; priced at {src}")
+        if leg == "stock":
+            pnl = asg.book_stock_sale(state, sp, price, today, f, shares=new, note=note)
+        else:
+            pnl = asg.book_long_sale(state, sp, price, today, f, contracts=int(round(new)), note=note)
+        pend["booked"] = booked + new
+        logging.warning("ASSIGNMENT UNWIND %s: booked %g %s from the tracked order @ %.2f (%s), "
+                        "P&L %+.0f", sp.key, new, "shares" if leg == "stock" else "long puts",
+                        price, src, pnl)
+    status = prog.get("status") if prog else None
+    done = pend["booked"] >= qty - 1e-9 if "booked" in pend else False
+    if done or (status and status not in _LIVE_STATUSES):
+        if state.has(sp.key):
+            sp.unwind_order = {}
+        return True
+    if status is None:
+        age = int(np.busday_count(pend.get("placed") or today, today))
+        if age >= 2:
+            # A DAY order cannot outlive the session after the one it was placed in.
+            logging.warning("ASSIGNMENT UNWIND %s: tracked %s order permId %s is not visible at IB "
+                            "and its session has ended — treated as expired", sp.key, leg,
+                            pend.get("permId"))
+            sp.unwind_order = {}
+            return True
+        sp.unwind_order = pend
+        logging.error("ASSIGNMENT UNWIND %s: tracked %s order permId %s is not visible at IB — NOT "
+                      "placing another (two orders could sell twice); check it in TWS", sp.key,
+                      leg, pend.get("permId"))
+        return False
+    sp.unwind_order = pend
+    logging.warning("ASSIGNMENT UNWIND %s: tracked %s order permId %s still working at IB (%s, "
+                    "%g of %g filled) — not re-placed", sp.key, leg, pend.get("permId"), status,
+                    pend["booked"], qty)
+    return False
 
 
 def escalate_assignments(state, today: str, level: str = "") -> list[str]:
@@ -205,6 +339,10 @@ def book_unrealized(state, values: dict, put_marks: dict, stock_marks: dict) -> 
     from options_vrp import assignment as asg
     tot = 0.0
     for sp in state.open_spreads:
+        if getattr(sp, "assign_suspected", 0) and not getattr(sp, "assigned_contracts", 0):
+            logging.warning("cannot value %s: short leg gone, delivery not confirmed (suspected "
+                            "assignment) — left out this run", sp.key)
+            continue
         if getattr(sp, "assigned_contracts", 0):
             u = asg.unrealized(sp, put_marks, stock_marks)
             if u is None:
@@ -702,8 +840,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         # 1) MANAGE open spreads
         values = broker.spread_values(state.open_spreads)
         for sp in list(state.open_spreads):
-            if getattr(sp, "assigned_contracts", 0):
-                continue                                # ASSIGNED: handled by the unwind above
+            if getattr(sp, "assigned_contracts", 0) or getattr(sp, "assign_suspected", 0):
+                continue                                # ASSIGNED / SUSPECTED: not a paired spread
             cv = values.get(sp.key)
             if cv is None:
                 continue
@@ -754,7 +892,15 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
         elif _bscale < 1.0:
             cfg.risk_per_trade *= _bscale
 
-        # 2) OPEN new spreads if the gate is open and we have room
+        # 2) OPEN new spreads if the gate is open, the market is open and we have room.
+        # MARKET-OPEN GUARD (2026-10-08): a closed or unknown market blocks NEW spreads only --
+        # the management closes above and the assignment unwind have already run, and no guard may
+        # block a close.
+        from options_vrp.market_hours import market_open
+        _mkt_ok, _mkt_how = market_open(broker)
+        if not _mkt_ok:
+            logging.warning("MARKET CLOSED (%s): no new spreads opened this run — closes and the "
+                            "assignment unwind are not affected", _mkt_how)
         res = target_book(cfg)
         # Logged in the LIVE path, not just dry_run: with the gate disabled via .env there is
         # otherwise no way to confirm from a live run which state it is actually in, and a
@@ -763,7 +909,7 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                      cfg.regime_thr,
                      "DISABLED (thr>=99)" if cfg.regime_thr >= 99 else
                      ("OPEN" if res.regime_open else "SHUT — no new premium sold"))
-        if res.regime_open:
+        if res.regime_open and _mkt_ok:
             room = cfg.max_positions - len(state.open_spreads)
             # One open position per ticker — never stack a 2nd spread on a name we already hold
             # (avoids concentrating idiosyncratic risk on one underlying).
@@ -984,7 +1130,8 @@ def run_live(cfg: OptionsConfig, port: int, client_id: int) -> None:
                 e = _ib_expiry(sp.expiry)
                 # An ASSIGNED short leg is expected to be gone (it is not a phantom); the long leg
                 # stays until the unwind sells it.
-                _n_a = int(getattr(sp, "assigned_contracts", 0) or 0)
+                _n_a = (int(getattr(sp, "assigned_contracts", 0) or 0)
+                        or int(getattr(sp, "assign_suspected", 0) or 0))
                 exp[(sp.ticker, e, float(sp.short_strike))] = -float(sp.contracts - _n_a)
                 exp[(sp.ticker, e, float(sp.long_strike))] = float(sp.contracts)
             keyed_exp = {f"{k[0]} {k[1]} {k[2]:g}P": v for k, v in exp.items()}
@@ -1022,7 +1169,17 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="run on weekends too")
     ap.add_argument("--port", type=int, default=int(os.getenv("IB_PORT", "7497")))
     ap.add_argument("--client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "7")))
+    ap.add_argument("--et-slot", default="", help="scheduled runs: proceed only near this New York "
+                    "time (HH:MM); the task starts at two local times so one always lands on it")
     args = ap.parse_args()
+    if args.et_slot:
+        from options_vrp.market_hours import et_now, in_et_slot
+        if not in_et_slot(args.et_slot):
+            # The other of the two scheduled starts (the DST half that does not land on the slot).
+            # Quiet by design: nothing has run, nothing to report.
+            logging.info("ET slot %s: it is %s ET — not this start's turn, exiting", args.et_slot,
+                         et_now().strftime("%H:%M"))
+            return
     cfg = _cfg(OptionsState.load(STATE_FILE))
 
     # KILL SWITCH (levels split 2026-10-07). HALT_HARD exits before connecting. HALT_ALL runs ONLY

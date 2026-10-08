@@ -28,7 +28,10 @@ def _rows(open_spreads, values, marks=None) -> str:
     out = []
     for sp in open_spreads:
         n_a = int(getattr(sp, "assigned_contracts", 0) or 0)
-        if n_a:
+        n_s = int(getattr(sp, "assign_suspected", 0) or 0)
+        if n_s and not n_a:
+            unreal, mark = None, f"SUSPECTED {n_s} of {sp.contracts} (cannot value)"
+        elif n_a:
             # ASSIGNED: no spread mark exists once the short leg is gone. Valued exactly as the
             # breaker and the NAV snapshot value it (assignment.unrealized), never left blank.
             unreal = unrealized(sp, *marks) if marks else None

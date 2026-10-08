@@ -2,8 +2,8 @@
 
 Nothing here changes behaviour. Each case records the current outcome -- detected or not,
 automatic or manual, alerted or not, valued or not -- so a change to any of them is deliberate.
-Cases where a position can sit outside normal management are marked PROPOSAL in the label and
-listed in the documentation (Appendix E); they are decisions for the owner, not fixes made here.
+Decision #17 (2026-10-08) is in: a short leg gone without the shares is recorded as SUSPECTED,
+kept out of management, warned as 'cannot value' and escalated daily.
 Drives the REAL detect / handle_assignments / book_unrealized with a fake broker.
 scripts/mutate_assignment_edges.py seeds the faults.
 
@@ -95,7 +95,13 @@ def first(state):
     """The first open spread, or an empty stand-in so a fault fails a check instead of crashing."""
     from types import SimpleNamespace as NS
     return state.open_spreads[0] if state.open_spreads else NS(
-        assigned_contracts=0, assigned_auto=None, contracts=0, assigned_stock_sold=None)
+        assigned_contracts=0, assigned_auto=None, contracts=0, assigned_stock_sold=None,
+        assign_suspected=0)
+
+
+def last(state) -> dict:
+    """The newest ledger row, or {} (a fault fails a check instead of crashing)."""
+    return state.trade_log[-1] if state.trade_log else {}
 
 
 def val(spread, pm, sm) -> float:
@@ -131,18 +137,62 @@ print("\n2. DELIVERY SPLIT — shares arrive in pieces, or over two days")
 st = OptionsState(open_spreads=[sp()])
 fb = FakeBroker(puts(0.0, 2.0), {"IWM": (100.0, 263.0)})              # short gone, half the shares
 run(st, fb)
-check("day 1: short leg gone, only 100 of 200 shares visible -> ERROR 'manual review', NOT recorded",
-      errors("manual review") and first(st).assigned_contracts == 0 and fb.calls == [],
-      str(LOG))
+check("day 1: short leg gone, only 100 of 200 shares visible -> recorded as SUSPECTED (decision #17), "
+      "not as assigned, nothing sold", first(st).assign_suspected == 2 and first(st).assigned_contracts == 0
+      and fb.calls == [] and errors("ASSIGNMENT SUSPECTED"), str(LOG))
+check("...one ASSIGNMENT_SUSPECTED ledger row", [t["action"] for t in st.trade_log] == ["ASSIGNMENT_SUSPECTED"],
+      str(st.trade_log))
 u = runner.book_unrealized(st, {}, *fb.marks())
-check("PROPOSAL: ...the unrecorded spread then has no spread mark and is left OUT of the breaker / "
-      "NAV snapshot with NO warning of its own (only the detection ERROR above)",
-      u == 0.0 and not [m for lv, m in LOG if "cannot value" in m], str((u, LOG)))
+check("...left out of the breaker / NAV snapshot WITH its own 'cannot value' warning (never silently)",
+      u == 0.0 and [m for lv, m in LOG if lv == "W" and "cannot value" in m and "suspected" in m],
+      str((u, LOG)))
+notes = asg.escalation_notes(st.open_spreads, "2026-10-12")
+check("...escalates daily like an assignment (URGENT by day 3), saying it is not managed or valued",
+      notes and "ASSIGNMENT SUSPECTED URGENT" in notes[0] and "not managed, not valued" in notes[0], str(notes))
+from options_vrp.email_report import _rows  # noqa: E402
+check("...the sleeve report marks the row 'SUSPECTED 2 of 2 (cannot value)'",
+      "SUSPECTED 2 of 2 (cannot value)" in _rows(st.open_spreads, {}, fb.marks()), "")
+run(st, fb)
+check("...a second run escalates without a duplicate ledger row",
+      [t["action"] for t in st.trade_log] == ["ASSIGNMENT_SUSPECTED"] and errors("ASSIGNMENT SUSPECTED"),
+      str(st.trade_log))
 fb.stocks = {"IWM": (200.0, 263.0)}
 run(st, fb)
 check("day 2: all 200 shares visible -> exact, recorded and unwound (200 sh, then 2 long puts)",
       fb.calls == [("STK", "IWM", 200), ("PUT", "IWM", 256.0, 2)] and st.open_spreads == [],
       str(fb.calls))
+_s = OptionsState(open_spreads=[sp(assign_suspected=2, assign_suspected_date="2026-10-07")])
+asg.mark_assigned(_s, asg.Assignment(_s.open_spreads[0].key, "IWM", 2, 200.0, 200.0, 263.0, True, "x"),
+                  "2026-10-08")
+check("confirming an assignment clears the suspicion (no double escalation line)",
+      _s.open_spreads[0].assign_suspected == 0 and len(asg.escalation_notes(_s.open_spreads, "2026-10-08")) == 1
+      and "SUSPECTED" not in asg.escalation_notes(_s.open_spreads, "2026-10-08")[0], "")
+check("...the suspicion became the assignment (ASSIGNED row follows ASSIGNMENT_SUSPECTED)",
+      [t["action"] for t in st.trade_log][:2] == ["ASSIGNMENT_SUSPECTED", "ASSIGNED"], str(st.trade_log))
+
+st = OptionsState(open_spreads=[sp()])
+fb = FakeBroker(puts(0.0, 2.0), {})
+run(st, fb)
+fb.put_pos = puts(-2.0, 2.0)                                          # the short leg is back
+run(st, fb)
+check("short leg back at IB -> suspicion CLEARED with a warning and a ledger row; a normal spread again",
+      first(st).assign_suspected == 0 and last(st).get("action") == "ASSIGNMENT_SUSPECTED_CLEARED"
+      and [m for lv, m in LOG if lv == "W" and "cleared" in m], str((st.trade_log, LOG)))
+st = OptionsState(open_spreads=[sp()])
+fb = FakeBroker(puts(0.0, 2.0), {})
+run(st, fb)
+fb.put_pos = puts(0.0, 0.0)                                           # long puts gone too
+run(st, fb)
+check("short AND long legs gone (closed by hand) -> retired as CLOSED_OUTSIDE, pointing at the "
+      "booking tool", st.open_spreads == [] and last(st).get("action") == "CLOSED_OUTSIDE"
+      and "book_hand_unwind.py" in last(st).get("note", ""), str(st.trade_log))
+st = OptionsState(open_spreads=[sp()])
+fb = FakeBroker(puts(0.0, 2.0), {"IWM": (100.0, 263.0)})
+run(st, fb)
+fb2 = FakeBroker(None, None)
+run(st, fb2)
+check("positions unavailable -> the suspicion is neither cleared nor retired (unknown is not 'back')",
+      first(st).assign_suspected == 2 and st.open_spreads, str(st.open_spreads))
 
 st = OptionsState(open_spreads=[sp()])
 fb = FakeBroker(puts(-1.0, 2.0), {"IWM": (100.0, 263.0)})            # 1 of 2 assigned
@@ -204,15 +254,16 @@ check("...recorded and valued on the 200 delivered shares only", first(st).assig
 st = OptionsState(open_spreads=[sp()])
 fb = FakeBroker(puts(0.0, 2.0), {"IWM": (150.0, 263.0)})
 run(st, fb)
-check("FEWER shares than 100 x n (150 for 2) -> ERROR every run, NOT recorded, nothing sold",
-      errors("only 150") and first(st).assigned_contracts == 0 and fb.calls == [], str(LOG))
+check("FEWER shares than 100 x n (150 for 2) -> SUSPECTED (not assigned), ERROR, nothing sold",
+      errors("only 150") and first(st).assign_suspected == 2 and first(st).assigned_contracts == 0
+      and fb.calls == [], str(LOG))
 run(st, fb)
 check("...and the ERROR repeats on the next run (it never goes quiet while the mismatch lasts)",
       errors("only 150"), str(LOG))
 st = OptionsState(open_spreads=[sp()])
 run(st, FakeBroker(puts(0.0, 2.0), {}))
-check("short leg gone and NO shares -> ERROR 'closed by hand, or not visible' (manual review)",
-      errors("closed by hand") and first(st).assigned_contracts == 0, str(LOG))
+check("short leg gone and NO shares -> SUSPECTED, ERROR 'closed by hand, or not visible'",
+      errors("closed by hand") and first(st).assign_suspected == 2, str(LOG))
 
 # =============================================================================================
 print("\n5. BLENDED — magic-formula already holds the name")
@@ -224,7 +275,7 @@ check("flagged: an ERROR naming the shares held vs expected and 'NOT unwound aut
       errors("260 IWM held") and errors("NOT unwound automatically"), str(LOG))
 check("recorded: ASSIGNED row, assigned_contracts 2, assigned_auto False",
       s0.assigned_contracts == 2 and not s0.assigned_auto
-      and st.trade_log[-1]["action"] == "ASSIGNED" and st.trade_log[-1]["exact"] is False, "")
+      and last(st).get("action") == "ASSIGNED" and last(st).get("exact") is False, "")
 check("valued: on the 200 delivered shares at the stock mark + the long puts (magic's 60 excluded)",
       abs(val(s0, *fb.marks()) - (0.74 + 254 - 263 + 3.5) * 200) < 1e-6, "")
 check("NOT traded: no share sale, no put sale", fb.calls == [], str(fb.calls))
@@ -240,8 +291,8 @@ check("owner sold the 200 shares by hand but kept the long puts -> STILL recorde
 fb.put_pos = puts(0.0, 0.0)                                          # ...then the long puts too
 run(st, fb)
 check("once the long puts are gone too -> spread retired (ASSIGNED_CLOSED_OUTSIDE), P&L NOT booked",
-      st.open_spreads == [] and st.trade_log[-1]["action"] == "ASSIGNED_CLOSED_OUTSIDE"
-      and st.realized_pnl == 0.0, str(st.trade_log[-1]))
+      st.open_spreads == [] and last(st).get("action") == "ASSIGNED_CLOSED_OUTSIDE"
+      and st.realized_pnl == 0.0, str(last(st)))
 
 print("\n" + "=" * 88)
 if _fails:

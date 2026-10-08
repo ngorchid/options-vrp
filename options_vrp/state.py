@@ -33,6 +33,17 @@ class OpenSpread:
     assigned_date: str = ""
     assigned_auto: bool = False
     assigned_stock_sold: bool = False
+    # SUSPECTED ASSIGNMENT (2026-10-08, decision #17): the short leg is gone but the 100 x n shares
+    # are not (all) visible. Kept out of management, warned as "cannot value" every run, escalated
+    # daily, until the shares appear (-> assigned) or the short leg is back (-> cleared).
+    assign_suspected: int = 0
+    assign_suspected_date: str = ""
+    # TRACKED UNWIND ORDER (2026-10-08, decision #15): a SAFETY sale that did not fill within the
+    # run's poll is left working at IB and recorded here ({leg, permId, qty, held_before, placed,
+    # booked, order_ref}); the next run books whatever filled. Shares already sold are counted so
+    # a partial fill is valued and booked share by share.
+    assigned_shares_sold: float = 0.0
+    unwind_order: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
