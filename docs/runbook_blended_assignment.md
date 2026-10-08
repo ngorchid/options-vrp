@@ -1,7 +1,8 @@
 # Runbook: an assigned put on a name magic-formula also holds (blended assignment)
 
 Derived from what the code does today (pinned by `scripts/test_assignment_edges.py`, section 5).
-Anything marked **check in IBKR** could not be verified from the code.
+Anything marked **check in IBKR** could not be verified from the code. Updated 2026-10-08: hand
+unwinds are booked with `scripts/book_hand_unwind.py`.
 
 ## 1. How you find out
 
@@ -61,16 +62,25 @@ margin, and if the put expires out of the money the shares stay with no hedge.
 ## 5. Afterwards — keep attribution correct
 
 1. **Next options-vrp run:** it sees the long puts gone and retires the spread with
-   `ASSIGNED_CLOSED_OUTSIDE`. The alerts stop. **The hand unwind's P&L is NOT booked in the
-   options-vrp ledger** (the code has no step for it); it appears in the book summary's
-   *unattributed* line of the NAV bridge.
+   `ASSIGNED_CLOSED_OUTSIDE`. The alerts stop. The sleeve books no P&L for a hand unwind itself.
 2. If you sold the shares but **kept** the puts, the sleeve still values the shares and keeps
    alerting: sell the puts too.
-3. **Record** in your notes: date, shares sold and price, puts sold/exercised and price,
-   commissions, IB execution ids, and the Order Ref used. That is what explains the unattributed
-   amount and the next audit email.
-4. **IB-records emails:** a tagged manual trade shows as `flex_tagged_unbooked` (it is in no
-   ledger); an untagged one as `flex_untagged` / `conflict`. **This repeats in every nightly email**:
-   the check re-reads all trades since 2026-10-06 and has no way to acknowledge a known hand trade
-   yet (open proposal). Your note from step 3 is what tells these lines apart from a real fault.
+3. **Book it** once the spread is retired, one command per trade, with IB's execution ids
+   (Trades window / the next IB-records archive), on the machine holding the live ledger:
+
+   ```bat
+   python scripts\book_hand_unwind.py --key <TICKER_YYYY-MM-DD_SHORT_LONG> --leg stock --side SELL ^
+       --qty <100 x n> --price <fill> --date <YYYY-MM-DD> --exec-ids <id1,id2> ^
+       --order-ref options-vrp:manual-YYYYMMDD --commission <IB commission>
+   python scripts\book_hand_unwind.py --key <same> --leg long --side SELL --qty <n> --price <fill> ^
+       --date <YYYY-MM-DD> --exec-ids <id> --order-ref options-vrp:manual-YYYYMMDD
+   ```
+   Each command previews the row and its P&L; add `--apply` to write it (a backup is made first).
+   It only appends: it refuses a spread still open, an execution id already booked, and more
+   shares or puts than the spread had. Exercising the puts instead (option B) is booked as a stock
+   SELL of 100 × n at the long strike (**check in IBKR** how the exercise appears in your trades).
+4. **IB-records emails:** a booked trade with its execution ids is matched like any fill; one
+   booked with the `options-vrp:manual-…` Order Ref but without ids is linked by the tag. Until it
+   is booked, a hand trade alerts in every nightly email (`flex_tagged_unbooked`, or
+   `flex_untagged` / `conflict` if untagged) — book it rather than ignore it.
 5. Check that magic-formula's reconcile no longer warns (IB shares = its ledger again).

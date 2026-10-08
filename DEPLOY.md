@@ -57,20 +57,35 @@ Run **daily on weekdays, during US market hours (RTH)** so entries fill the same
 management can act same-day. ~15:30 ET is a good slot — late enough for stable chains,
 before the close.
 
-⚠ `/ST` uses the BOX's LOCAL clock, and the box is on CET — so this must be **21:30**, not
-15:30. It read 15:30 until 2026-08-14, which is 09:30 ET: the market OPEN, the widest
-spreads and least stable chains of the day. Since the cost guard keys entirely off spread
-width, that systematically inflated measured cost-of-credit and would have skipped trades
-that should pass.
+⚠ `/ST` uses the BOX's LOCAL clock (CET), and Task Scheduler has no per-task US time zone. A
+single 21:30 start is 15:30 ET only while Europe and the US are both on summer or both on winter
+time; in the daylight-saving gap weeks (US second Sunday of March → EU last Sunday of March, EU
+last Sunday of October → US first Sunday of November) it is 16:30 ET, AFTER the close. (Before
+2026-08-14 the task read 15:30 local = 09:30 ET, the open, which inflated measured costs.)
+
+**Since 2026-10-08 the run time is anchored to US Eastern:** two tasks start at 20:30 and 21:30
+local, both with `--et-slot 15:30`. The runner proceeds only within 20 minutes of 15:30 New York
+time, so exactly one of them runs each day (verified for every weekday of 2026–2027); the other
+logs "not this start's turn" and exits without connecting. A manual run without `--et-slot` is
+not affected.
+
+Independently, a **market-open guard** asks IB for today's trading hours (holidays and early
+closes included; the clock as fallback) before opening anything: a closed market blocks NEW spreads
+and puts a WARNING in the email. Management closes and the assignment unwind still run.
 
 Running LAST is also deliberate: margin in the shared account is first-come-first-served,
 and this is the lowest-Sharpe sleeve (0.52 vs magic-formula 0.96, trend 0.74).
 
 ```bat
 schtasks /Create /TN "OptionsVRPPaper" ^
-  /TR "C:\trading\options-vrp\scripts\run_options_paper.py --live" ^
+  /TR "C:\trading\options-vrp\scripts\run_options_paper.py --live --et-slot 15:30" ^
   /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 21:30 /F
+schtasks /Create /TN "OptionsVRPPaperDST" ^
+  /TR "C:\trading\options-vrp\scripts\run_options_paper.py --live --et-slot 15:30" ^
+  /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 20:30 /F
 ```
+If the existing task runs a `.bat` wrapper, add `--et-slot 15:30` to the python line inside it and
+point the second task at the same wrapper.
 (Wrap in a .bat that activates the venv, like the other systems, if preferred.)
 
 ## Notes
@@ -134,10 +149,12 @@ Under every level an open assigned position raises a daily ERROR that escalates 
      **exercise** it instead, in TWS (Option Exercise) — the shares are then sold at the long
      strike, settling the next day. Do this *instead of* step 2, not after it.
 4. Leave any contracts that were **not** assigned alone: they are still a paired spread.
-5. **Nothing to edit in `state.json`.** At its next run the sleeve sees the long puts gone and
-   retires the spread (`ASSIGNED_CLOSED_OUTSIDE`); the outside P&L is not booked by the sleeve —
-   IB's statement is the record. The next morning's two-way check flags the hand-placed orders as
-   untagged; that alert is expected and confirms them.
+5. **Nothing to edit in `state.json` by hand.** At its next run the sleeve sees the long puts gone
+   and retires the spread (`ASSIGNED_CLOSED_OUTSIDE`) without booking the outside P&L. Then book
+   each hand trade with `scripts\book_hand_unwind.py` (append-only; preview first, `--apply` to
+   write; steps in `docs/runbook_blended_assignment.md`). Put `options-vrp:manual-YYYYMMDD` in the
+   orders' Order Ref. Until they are booked, the nightly two-way check alerts on the hand-placed
+   orders every night.
 
 ### What one assignment does to the account (check it in IBKR before it happens)
 
